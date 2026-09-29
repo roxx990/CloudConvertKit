@@ -15,6 +15,9 @@ final class ProgressReporter: @unchecked Sendable {
     private let handler: ConversionProgressHandler?
     private var current: ConversionProgress
     private var highWaterMark: Double = 0
+    /// Set by the terminal stage. Late transfer callbacks (URLSession delivers
+    /// progress on its own queue) must not report `.uploading` after `.cancelled`.
+    private var isFinished = false
 
     // Upload bookkeeping: bytes per upload task.
     private var uploadTotals: [String: Int64] = [:]
@@ -39,6 +42,8 @@ final class ProgressReporter: @unchecked Sendable {
 
     func stage(_ stage: ConversionProgress.Stage, jobAttempt: Int? = nil, jobID: String? = nil) {
         lock.lock()
+        guard !isFinished else { lock.unlock(); return }
+        if stage.isTerminal { isFinished = true }
         current.stage = stage
         if let jobAttempt { current.jobAttempt = jobAttempt }
         if let jobID { current.jobID = jobID }
@@ -51,9 +56,7 @@ final class ProgressReporter: @unchecked Sendable {
         default:
             break
         }
-        let snapshot = current
-        lock.unlock()
-        handler?(snapshot)
+        deliverLocked()
     }
 
     /// A rebuilt job starts its transfers over; progress must not run backwards
@@ -80,6 +83,7 @@ final class ProgressReporter: @unchecked Sendable {
 
     func upload(taskName: String, progress: TransferProgress) {
         lock.lock()
+        guard !isFinished else { lock.unlock(); return }
         if progress.totalBytes > 0 { uploadTotals[taskName] = progress.totalBytes }
         uploadCompleted[taskName] = progress.completedBytes
         let total = uploadTotals.values.reduce(0, +)
@@ -89,9 +93,7 @@ final class ProgressReporter: @unchecked Sendable {
         current.bytesTransferred = done
         current.bytesTotal = total
         setFractionLocked(weights.upload * fraction)
-        let snapshot = current
-        lock.unlock()
-        handler?(snapshot)
+        deliverLocked()
     }
 
     func uploadFinished(taskName: String) {
@@ -105,14 +107,13 @@ final class ProgressReporter: @unchecked Sendable {
     /// `fraction` is 0…1 within the processing phase.
     func processing(fraction: Double, jobID: String?) {
         lock.lock()
+        guard !isFinished else { lock.unlock(); return }
         current.stage = .processing
         current.bytesTransferred = nil
         current.bytesTotal = nil
         if let jobID { current.jobID = jobID }
         setFractionLocked(weights.upload + weights.processing * min(0.98, max(0, fraction)))
-        let snapshot = current
-        lock.unlock()
-        handler?(snapshot)
+        deliverLocked()
     }
 
     // MARK: Downloads
@@ -126,6 +127,7 @@ final class ProgressReporter: @unchecked Sendable {
 
     func download(index: Int, progress: TransferProgress) {
         lock.lock()
+        guard !isFinished else { lock.unlock(); return }
         if progress.totalBytes > 0 { downloadTotals[index] = progress.totalBytes }
         downloadCompleted[index] = progress.completedBytes
         let total = downloadTotals.values.reduce(0, +)
@@ -135,9 +137,7 @@ final class ProgressReporter: @unchecked Sendable {
         current.bytesTransferred = done
         current.bytesTotal = total
         setFractionLocked(weights.upload + weights.processing + weights.download * fraction)
-        let snapshot = current
-        lock.unlock()
-        handler?(snapshot)
+        deliverLocked()
     }
 
     func downloadFinished(index: Int) {
@@ -147,6 +147,15 @@ final class ProgressReporter: @unchecked Sendable {
     }
 
     // MARK: Helpers
+
+    /// Calls the handler while still holding the lock, so updates reach the
+    /// handler in the order they were made and none arrives after the
+    /// terminal stage. Unlocks.
+    private func deliverLocked() {
+        let snapshot = current
+        handler?(snapshot)
+        lock.unlock()
+    }
 
     private func setFractionLocked(_ value: Double) {
         highWaterMark = max(highWaterMark, min(1, max(0, value)))

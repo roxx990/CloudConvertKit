@@ -115,11 +115,35 @@ public final class CloudConvertAPI: CloudConvertAPIClient, @unchecked Sendable {
 
     // MARK: Jobs
 
+    /// Not idempotent: CloudConvert creates (and, for `import/url` jobs, runs
+    /// and bills) a job for every request it receives. Unless every import is
+    /// an upload, it is only re-sent when the previous attempt provably never
+    /// reached the server.
     public func createJob(_ specification: JobSpecification) async throws -> CCJob {
         try specification.validate()
         let body = try encoder.encode(specification.requestBody)
-        let envelope: CCDataEnvelope<CCJob> = try await send(method: "POST", path: "jobs", body: body, phase: .creatingJob, label: "createJob")
-        return envelope.data
+        // A duplicate of an upload-only job just waits for an upload that
+        // never comes and expires unbilled, so those may be re-sent as before.
+        let repeatable = specification.startsOnlyAfterUpload
+        let response = try await sendRaw(method: "POST", path: "jobs", body: body, phase: .creatingJob, label: "createJob",
+                                         policy: retryPolicy, isSafeToRepeat: { repeatable || $0.provesRequestWasNotProcessed })
+        do {
+            return try decode(CCDataEnvelope<CCJob>.self, from: response, label: "createJob").data
+        } catch {
+            // The job exists but is unusable; don't leave it on CloudConvert.
+            if let id = CloudConvertAPI.jobID(inCreateResponse: response.body) {
+                logger.error("createJob: deleting job \(id) whose response could not be decoded")
+                Task.detached(priority: .utility) { [self] in try? await self.deleteJob(id: id) }
+            }
+            throw error
+        }
+    }
+
+    /// `data.id` from a response too odd to decode as a `CCJob`.
+    static func jobID(inCreateResponse body: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let data = object["data"] as? [String: Any] else { return nil }
+        return data["id"] as? String
     }
 
     public func getJob(id: String) async throws -> CCJob {
@@ -146,9 +170,12 @@ public final class CloudConvertAPI: CloudConvertAPIClient, @unchecked Sendable {
         return envelope.data
     }
 
+    /// Not idempotent (each retry is a new, billed task): re-sent only when
+    /// the previous attempt provably never reached the server.
     public func retryTask(id: String) async throws -> CCTask {
-        let envelope: CCDataEnvelope<CCTask> = try await send(method: "POST", path: "tasks/\(id)/retry", phase: .processing, label: "retryTask")
-        return envelope.data
+        let response = try await sendRaw(method: "POST", path: "tasks/\(id)/retry", body: nil, phase: .processing, label: "retryTask",
+                                         policy: retryPolicy, isSafeToRepeat: { $0.provesRequestWasNotProcessed })
+        return try decode(CCDataEnvelope<CCTask>.self, from: response, label: "retryTask").data
     }
 
     public func cancelTask(id: String) async throws -> CCTask {
@@ -190,6 +217,10 @@ public final class CloudConvertAPI: CloudConvertAPIClient, @unchecked Sendable {
                                     phase: ConversionPhase,
                                     label: String) async throws -> T {
         let response = try await sendRaw(method: method, path: path, query: query, body: body, phase: phase, label: label, policy: retryPolicy)
+        return try decode(T.self, from: response, label: label)
+    }
+
+    private func decode<T: Decodable>(_ type: T.Type, from response: HTTPResponse, label: String) throws -> T {
         do {
             return try decoder.decode(T.self, from: response.body)
         } catch {
@@ -206,11 +237,13 @@ public final class CloudConvertAPI: CloudConvertAPIClient, @unchecked Sendable {
                          body: Data?,
                          phase: ConversionPhase,
                          label: String,
-                         policy: RetryPolicy) async throws -> HTTPResponse {
+                         policy: RetryPolicy,
+                         isSafeToRepeat: (@Sendable (CloudConvertError) -> Bool)? = nil) async throws -> HTTPResponse {
         let connectivity = self.connectivity
         let offlineWaitTimeout = self.offlineWaitTimeout
         return try await retrying(policy: policy, phase: phase, logger: logger, label: label,
                                   waitForNetwork: { try await connectivity.waitUntilConnected(timeout: offlineWaitTimeout) },
+                                  isSafeToRepeat: isSafeToRepeat,
                                   operation: {
             try await self.performOnce(method: method, path: path, query: query, body: body, label: label)
         })

@@ -52,9 +52,10 @@ public struct CCJob: Decodable, Equatable, Sendable {
         id = try container.decode(String.self, forKey: .id)
         tag = try container.decodeIfPresent(String.self, forKey: .tag)
         status = try container.decodeIfPresent(CCStatus.self, forKey: .status) ?? .processing
-        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt)
-        startedAt = try container.decodeIfPresent(Date.self, forKey: .startedAt)
-        endedAt = try container.decodeIfPresent(Date.self, forKey: .endedAt)
+        // Timestamps are informational; an odd one must not fail the job.
+        createdAt = try? container.decodeIfPresent(Date.self, forKey: .createdAt)
+        startedAt = try? container.decodeIfPresent(Date.self, forKey: .startedAt)
+        endedAt = try? container.decodeIfPresent(Date.self, forKey: .endedAt)
         tasks = try container.decodeIfPresent([CCTask].self, forKey: .tasks) ?? []
     }
 
@@ -113,7 +114,7 @@ public struct CCTask: Decodable, Equatable, Sendable {
         status = try container.decodeIfPresent(CCStatus.self, forKey: .status) ?? .processing
         message = try container.decodeIfPresent(String.self, forKey: .message)
         code = try container.decodeIfPresent(String.self, forKey: .code)
-        credits = try container.decodeIfPresent(Int.self, forKey: .credits)
+        credits = CCLenient.int(container, .credits)
         // `percent` is not consistently present; tolerate number or string.
         if let value = try? container.decodeIfPresent(Double.self, forKey: .percent) {
             percent = value
@@ -122,35 +123,51 @@ public struct CCTask: Decodable, Equatable, Sendable {
         } else {
             percent = nil
         }
-        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt)
-        startedAt = try container.decodeIfPresent(Date.self, forKey: .startedAt)
-        endedAt = try container.decodeIfPresent(Date.self, forKey: .endedAt)
-        engine = try container.decodeIfPresent(String.self, forKey: .engine)
-        engineVersion = try container.decodeIfPresent(String.self, forKey: .engineVersion)
+        createdAt = try? container.decodeIfPresent(Date.self, forKey: .createdAt)
+        startedAt = try? container.decodeIfPresent(Date.self, forKey: .startedAt)
+        endedAt = try? container.decodeIfPresent(Date.self, forKey: .endedAt)
+        engine = try? container.decodeIfPresent(String.self, forKey: .engine)
+        engineVersion = try? container.decodeIfPresent(String.self, forKey: .engineVersion)
         retryOfTaskID = try container.decodeIfPresent(String.self, forKey: .retryOfTaskID)
-        result = try container.decodeIfPresent(CCTaskResult.self, forKey: .result)
+        // An empty result may be serialised as `[]` instead of `{}` or `null`.
+        result = try? container.decodeIfPresent(CCTaskResult.self, forKey: .result)
     }
 
     public var failureCode: TaskFailureCode? {
-        status == .error ? TaskFailureCode(rawCode: code) : nil
+        status == .error ? TaskFailureCode(task: self) : nil
     }
 }
 
 /// `result` differs per operation: `import/upload` returns a `form`,
 /// `export/url` returns `files`, `metadata` returns `metadata`.
+///
+/// Decoded leniently: one task's odd `result` must never make the whole job
+/// undecodable, because the engine only reads the upload forms and the export
+/// task's files. A field that does not decode is `nil` instead.
 public struct CCTaskResult: Decodable, Equatable, Sendable {
     public let form: CCUploadForm?
+    /// Files that can be downloaded, i.e. entries that carry a `url`.
+    ///
+    /// Only `export/url` tasks list files with URLs. Other tasks (`convert`,
+    /// a finished `import/upload`, …) list theirs by `filename` and `size`
+    /// alone; those entries are left out rather than failing the decode.
     public let files: [CCExportedFile]?
     public let metadata: [String: JSONValue]?
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        form = try container.decodeIfPresent(CCUploadForm.self, forKey: .form)
-        files = try container.decodeIfPresent([CCExportedFile].self, forKey: .files)
-        metadata = try container.decodeIfPresent([String: JSONValue].self, forKey: .metadata)
+        form = try? container.decodeIfPresent(CCUploadForm.self, forKey: .form)
+        files = (try? container.decodeIfPresent([LossyExportedFile].self, forKey: .files))?.compactMap(\.file)
+        metadata = try? container.decodeIfPresent([String: JSONValue].self, forKey: .metadata)
     }
 
     enum CodingKeys: String, CodingKey { case form, files, metadata }
+
+    /// Decodes one `files` entry, or `nil` when it has no usable `url`.
+    private struct LossyExportedFile: Decodable {
+        let file: CCExportedFile?
+        init(from decoder: Decoder) throws { file = try? CCExportedFile(from: decoder) }
+    }
 }
 
 /// Upload target for `import/upload`. Parameters are opaque and must be sent
@@ -431,7 +448,7 @@ struct OrderedStringDictionary: Decodable {
             switch value {
             case .string(let s): strings[key] = s
             case .int(let i): strings[key] = String(i)
-            case .double(let d): strings[key] = d.rounded() == d ? String(Int64(d)) : String(d)
+            case .double(let d): strings[key] = d.rounded() == d && abs(d) < 9e18 ? String(Int64(d)) : String(d)
             case .bool(let b): strings[key] = b ? "true" : "false"
             case .null, .array, .object: continue
             }

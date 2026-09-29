@@ -35,26 +35,54 @@ final class FakeAPI: CloudConvertAPIClient, @unchecked Sendable {
         get { jobStatusScripts[0] }
         set { jobStatusScripts = [newValue] }
     }
+    /// `code` of the failed processing task. `nil` sends `"code": null`, which
+    /// is what CloudConvert does when an engine cannot convert the file.
     var failureCode: String? = nil
     var exportFiles: [(filename: String, size: Int64?, url: String)] = [(filename: "output.pdf", size: 10, url: "https://storage.example/output.pdf")]
     var getJobErrors: [CloudConvertError] = []
     var deletedJobIDs: [String] = []
+    /// Whether storage has received the upload. When set, upload tasks stay
+    /// `waiting` until it returns true, like the real API. `nil`: always true.
+    var serverHasUpload: (@Sendable () -> Bool)?
+    /// When set, `getJob` fails like a response that cannot be parsed.
+    var getJobAlwaysUndecodable = false
+    /// When true, created jobs come back without upload forms.
+    var omitUploadForms = false
+    /// Awaited inside `createJob` after the job was created server-side and
+    /// before the response arrives (e.g. to cancel mid-request).
+    var createJobHook: (@Sendable (_ jobID: String) async throws -> Void)?
+    var createdJobIDs: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return (0..<createdJobCount).map { "job-\($0 + 1)" }
+    }
+    var deletedJobIDsSnapshot: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return deletedJobIDs
+    }
     private(set) var pollCount = 0
     private var statusIndex = 0
     private var createdJobCount = 0
 
     func createJob(_ specification: JobSpecification) async throws -> CCJob {
-        lock.lock(); defer { lock.unlock() }
-        if let createJobError { throw createJobError }
+        lock.lock()
+        if let createJobError { lock.unlock(); throw createJobError }
         createdSpecifications.append(specification)
         createdJobCount += 1
         statusIndex = 0
-        return try makeJob(id: "job-\(createdJobCount)", specification: specification, status: .waiting, includeForms: true)
+        let id = "job-\(createdJobCount)"
+        let hook = createJobHook
+        let job = Result { try makeJob(id: id, specification: specification, status: .waiting, includeForms: !omitUploadForms) }
+        lock.unlock()
+        if let hook { try await hook(id) }
+        return try job.get()
     }
 
     func getJob(id: String) async throws -> CCJob {
         lock.lock(); defer { lock.unlock() }
         pollCount += 1
+        if getJobAlwaysUndecodable {
+            throw CloudConvertError.decoding(reason: "getJob: DecodingError.dataCorrupted: not JSON")
+        }
         if !getJobErrors.isEmpty { throw getJobErrors.removeFirst() }
         guard let spec = createdSpecifications.last ?? seededSpecification else {
             throw CloudConvertError.notFound(nil)
@@ -85,16 +113,18 @@ final class FakeAPI: CloudConvertAPIClient, @unchecked Sendable {
             let isProcessing = !task.isImport && !task.isExport
             let taskStatus: String
             switch status {
-            case .error: taskStatus = isProcessing ? "error" : (task.isImport ? "finished" : "waiting")
+            case .error: taskStatus = task.isImport ? "finished" : "error"   // the export fails with INPUT_TASK_FAILED
             case .finished: taskStatus = "finished"
             case .waiting: taskStatus = "waiting"                      // fresh job: nothing uploaded yet
             case .processing: taskStatus = task.isImport ? "finished" : "waiting"
             }
+            let uploadArrived = serverHasUpload?() ?? true
+            let taskStatusAsSeen = task.isUpload && !uploadArrived ? "waiting" : taskStatus
             var object: [String: Any] = [
                 "id": "task-\(task.name)",
                 "name": task.name,
                 "operation": task.operation,
-                "status": taskStatus,
+                "status": taskStatusAsSeen,
             ]
             if task.isUpload, includeForms {
                 object["result"] = ["form": ["url": "https://upload.example/\(task.name)",
@@ -102,16 +132,25 @@ final class FakeAPI: CloudConvertAPIClient, @unchecked Sendable {
                                                             "max_file_size": "10000000000",
                                                             "signature": "sig"]]]
             }
+            // Like the real API, only the export task's files carry a `url`;
+            // processing and finished upload tasks list files by name and size.
             if task.isExport, status == .finished {
                 object["result"] = ["files": exportFiles.map { file -> [String: Any] in
                     var f: [String: Any] = ["filename": file.filename, "url": file.url]
                     if let size = file.size { f["size"] = size }
                     return f
                 }]
+            } else if isProcessing, status == .finished {
+                object["result"] = ["files": exportFiles.map { ["filename": $0.filename, "size": $0.size ?? 0] }]
+            } else if task.isUpload, taskStatus == "finished", status != .waiting {
+                object["result"] = ["files": [["filename": "input.bin", "size": 1024]]]
             }
-            if status == .error, !task.isImport, !task.isExport {
-                object["code"] = failureCode ?? "CONVERSION_FAILED"
-                object["message"] = "scripted failure"
+            if status == .error, isProcessing {
+                object["code"] = failureCode ?? NSNull()
+                object["message"] = failureCode == nil ? "Conversion failed" : "scripted failure"
+            } else if status == .error, task.isExport {
+                object["code"] = "INPUT_TASK_FAILED"
+                object["message"] = "Input task has failed"
             }
             tasks.append(object)
         }
@@ -131,6 +170,10 @@ final class FakeTransfers: FileTransferring, @unchecked Sendable {
     var downloadStatuses: [Int] = [200]
     var downloadContent = Data("converted".utf8)
     var uploadDelay: TimeInterval = 0
+    /// The next N uploads reach storage but their response is lost (timeout).
+    var lostResponses = 0
+    private(set) var receivedUploads = 0
+    var receivedUploadsSnapshot: Int { lock.lock(); defer { lock.unlock() }; return receivedUploads }
     private(set) var uploads: [(id: String, bodySize: Int64)] = []
     private(set) var downloads: [String] = []
     private(set) var cancelled: [String] = []
@@ -141,9 +184,13 @@ final class FakeTransfers: FileTransferring, @unchecked Sendable {
         lock.lock()
         uploads.append((id, size))
         let status = uploadStatuses.count > 1 ? uploadStatuses.removeFirst() : uploadStatuses[0]
+        let loseResponse = lostResponses > 0
+        if loseResponse { lostResponses -= 1 }
         lock.unlock()
         if uploadDelay > 0 { try await Task.sleep(nanoseconds: UInt64(uploadDelay * 1_000_000_000)) }
         try Task.checkCancellation()
+        if (200...299).contains(status) { lock.lock(); receivedUploads += 1; lock.unlock() }
+        if loseResponse { throw URLError(.timedOut) }
         progress(TransferProgress(completedBytes: size / 2, totalBytes: size))
         progress(TransferProgress(completedBytes: size, totalBytes: size))
         return TransferOutcome(status: status, responseBody: nil, fileURL: nil, errorDescription: nil, urlErrorCode: nil, finishedAt: Date())

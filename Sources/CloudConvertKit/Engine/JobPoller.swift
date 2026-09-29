@@ -53,14 +53,18 @@ struct JobPoller: Sendable {
                     continue
                 default:
                     if error.isConnectivityRelated {
+                        // Falls through to the normal sleep: when the network
+                        // path is up but the host is unreachable (captive
+                        // portal, proxy down) the wait returns at once, and
+                        // `continue` would poll in a tight loop.
                         logger.notice("Job \(jobID): offline while polling; waiting for connectivity")
                         try await connectivity.waitUntilConnected(timeout: offlineWaitTimeout)
-                        continue
-                    }
-                    consecutiveFailures += 1
-                    logger.warning("Job \(jobID): poll failed (\(consecutiveFailures)/\(policy.maxConsecutiveFailures)): \(error.analyticsCode)")
-                    if consecutiveFailures >= policy.maxConsecutiveFailures {
-                        throw error
+                    } else {
+                        consecutiveFailures += 1
+                        logger.warning("Job \(jobID): poll failed (\(consecutiveFailures)/\(policy.maxConsecutiveFailures)): \(error.analyticsCode)")
+                        if consecutiveFailures >= policy.maxConsecutiveFailures {
+                            throw error
+                        }
                     }
                 }
             } catch {

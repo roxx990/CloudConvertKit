@@ -26,7 +26,9 @@ let package = Package(
         .testTarget(
             name: "CloudConvertKitTests",
             dependencies: ["CloudConvertKit"],
-            path: "Tests/CloudConvertKitTests"
+            path: "Tests/CloudConvertKitTests",
+            // Real `GET /v2/jobs/{id}` responses (signed URLs redacted).
+            resources: [.copy("Fixtures")]
         ),
     ]
 )

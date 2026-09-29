@@ -89,6 +89,12 @@ public struct JobSpecification: Equatable, Sendable, Codable {
         self.webhookURL = webhookURL
     }
 
+    /// True when every import is an `import/upload`: nothing runs (or is
+    /// billed) until the app uploads, so a duplicate job is harmless.
+    var startsOnlyAfterUpload: Bool {
+        tasks.filter(\.isImport).allSatisfy(\.isUpload)
+    }
+
     public var uploadTaskNames: [String] {
         tasks.filter(\.isUpload).map(\.name)
     }

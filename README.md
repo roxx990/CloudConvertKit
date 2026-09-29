@@ -32,7 +32,7 @@ iOS 15+, macOS 12+, Swift 5.9+ (Xcode 15 or newer). Mac Catalyst works unchanged
 **Swift Package Manager**
 
 ```swift
-.package(url: "https://github.com/roxx990/CloudConvertKit.git", from: "1.0.0"),
+.package(url: "https://github.com/roxx990/CloudConvertKit.git", from: "1.0.1"),
 // then, per target:
 .product(name: "CloudConvertKit", package: "CloudConvertKit")
 ```
@@ -99,6 +99,8 @@ CloudConvertConfiguration.direct(apiKey: key,
 ```
 
 Available environments: `.production`, `.europe`, `.unitedStates`, `.sandbox`, and `.proxy(baseURL:)`.
+
+> **Always pass `environment:` explicitly.** If you leave it out, `direct(...)` uses **`.sandbox`**, not `.production`. A production API key sent to the sandbox fails with `401` (`CloudConvertError.unauthorized`). The default will be removed in the next major version.
 
 ### Through your own backend (recommended for shipping apps)
 
@@ -394,6 +396,16 @@ swift test
 ```
 
 The suite runs entirely against in-memory fakes for the API, the transfer layer and connectivity. It covers the happy path, output naming, multi-file export, deterministic versus transient failure handling, upload rejection leading to a job rebuild, storage 5xx retrying against the same form, offline timeouts, cancellation cleanup both mid-upload and during a rebuild delay, resuming from a persisted record without re-uploading, running conversions being excluded from "pending", queue concurrency, retry and backoff arithmetic, error mapping, and model decoding.
+
+`Tests/CloudConvertKitTests/Fixtures/` holds real `GET /v2/jobs/{id}` responses (a finished job and a failed one, signed URLs redacted). The regression tests run them through the real `CloudConvertAPI` decoder, and the fakes follow the same shapes: only export tasks list files with a `url`, and an engine that cannot convert a file reports `code: null`.
+
+`StressTests` runs 150 conversions at once against a simulated CloudConvert with seeded faults at every layer, including cancellation at random moments. It then checks that every conversion ends exactly once, that no file is billed twice, that every known job is deleted and that no local state is left. Each run prints its seed; replay one or scale up with:
+
+```bash
+CCK_STRESS_SEED=1790701569452 CCK_STRESS_COUNT=1000 swift test --filter StressTests
+```
+
+Run the suite under Thread Sanitizer with `swift test --sanitize=thread`. Codesign rejects test bundles built under `~/Documents` (Finder metadata), so build elsewhere there: `swift test --scratch-path /tmp/cck-build`.
 
 For a live smoke test use `CloudConvertConfiguration.direct(apiKey:environment: .sandbox, …)` with a file whitelisted in the CloudConvert sandbox dashboard.
 

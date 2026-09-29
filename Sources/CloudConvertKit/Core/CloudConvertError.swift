@@ -40,15 +40,31 @@ public enum TaskFailureCode: Equatable, Sendable {
         }
     }
 
+    /// The failure code of a task, taking the operation into account.
+    ///
+    /// CloudConvert reports an engine that could not convert the file as a
+    /// processing task with `code: null` and a message such as "Conversion
+    /// failed", so a processing task without a code is `.conversionFailed`.
+    /// Import and export tasks without a code stay `.other("UNKNOWN")`.
+    init(task: CCTask) {
+        let isTransfer = task.operation.hasPrefix("import/") || task.operation.hasPrefix("export/")
+        if task.code?.isEmpty ?? true, !isTransfer {
+            self = .conversionFailed
+        } else {
+            self.init(rawCode: task.code)
+        }
+    }
+
     /// Whether re-running the whole job (fresh upload) has a realistic chance
     /// of succeeding. Deterministic failures (unsupported conversion, corrupt
-    /// file) are not retried; they would only burn credits.
+    /// file) are not retried; they would only burn credits. Unknown codes are
+    /// treated the same way: only the codes listed as transient are retried.
     public var isRetryable: Bool {
         switch self {
-        case .timeout, .other, .inputTaskFailed, .downloadFailed, .uploadFailed:
+        case .timeout, .inputTaskFailed, .downloadFailed, .uploadFailed:
             return true
         case .conversionFailed, .invalidConversionType, .sandboxFileNotAllowed,
-             .cancelled, .openFailed, .fileTooLarge, .insufficientCredits:
+             .cancelled, .openFailed, .fileTooLarge, .insufficientCredits, .other:
             return false
         }
     }
@@ -186,7 +202,8 @@ public extension CloudConvertError {
         case .jobFailed(_, _, let code, _):
             return code.isRetryable
         case .invalidResponse, .decoding:
-            // Usually a transient proxy/CDN hiccup returning HTML; worth one more try.
+            // Usually a transient proxy/CDN hiccup returning HTML; worth one more
+            // request. Never a reason to rebuild the job (see `requiresNewJob`).
             return true
         case .fileNotFound, .fileNotReadable, .emptyFile, .fileTooLarge, .insufficientDiskSpace,
              .invalidRequest, .storage, .cancelled, .unauthorized, .paymentRequired, .forbidden,
@@ -222,7 +239,9 @@ public extension CloudConvertError {
     }
 
     /// True when the *upload form* must be recreated (i.e. the whole job must be
-    /// rebuilt) rather than retrying the same HTTP request.
+    /// rebuilt) rather than retrying the same HTTP request. Only errors that
+    /// show the job itself is unusable qualify: a rebuild uploads the input
+    /// again and, once the job has converted, is billed again.
     var requiresNewJob: Bool {
         switch self {
         case .uploadFormExpired, .uploadRejected, .jobLost, .transferLost:
@@ -233,6 +252,33 @@ public extension CloudConvertError {
             return false
         }
     }
+
+    /// True when the request provably never reached the server (no
+    /// connection, or the server refused it before processing), so a request
+    /// that is not idempotent, such as `POST /jobs`, can be sent again without
+    /// risking a duplicate. A timeout, a dropped connection or a 5xx can
+    /// happen after the server acted, so they do not qualify.
+    var provesRequestWasNotProcessed: Bool {
+        switch self {
+        case .notConnected, .rateLimited:
+            return true
+        case .network(let code, _):
+            return CloudConvertError.connectionNeverEstablishedURLErrorCodes.contains(code)
+        default:
+            return false
+        }
+    }
+
+    static let connectionNeverEstablishedURLErrorCodes: Set<URLError.Code> = [
+        .notConnectedToInternet,
+        .cannotFindHost,
+        .cannotConnectToHost,
+        .dnsLookupFailed,
+        .internationalRoamingOff,
+        .dataNotAllowed,
+        .callIsActive,
+        .secureConnectionFailed,
+    ]
 
     static let connectivityURLErrorCodes: Set<URLError.Code> = [
         .notConnectedToInternet,
@@ -358,6 +404,9 @@ extension CloudConvertError: LocalizedError {
                 return "The conversion service is temporarily unavailable. Please try again later."
             case .cancelled:
                 return "The conversion was cancelled."
+            case .conversionFailed where message == nil || message?.isEmpty == true
+                                        || message?.lowercased() == "conversion failed":
+                return "This file could not be converted. It may be damaged or in an unsupported format."
             default:
                 if let message, !message.isEmpty { return "Conversion failed: \(message)" }
                 return "The conversion failed. Please try again or use a different file."

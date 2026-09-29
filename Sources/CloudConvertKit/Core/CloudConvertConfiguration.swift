@@ -222,6 +222,11 @@ public extension CloudConvertConfiguration {
     }
 
     /// Talk to CloudConvert directly with an API key (development / sandbox).
+    ///
+    /// - Important: `environment` defaults to **`.sandbox`**, not `.production`.
+    ///   A production API key used against the sandbox is rejected with 401
+    ///   (`CloudConvertError.unauthorized`). Always pass `environment:`
+    ///   explicitly; the default will be removed in the next major version.
     static func direct(apiKey: String,
                        environment: CloudConvertEnvironment = .sandbox,
                        backgroundSessionIdentifier: String,

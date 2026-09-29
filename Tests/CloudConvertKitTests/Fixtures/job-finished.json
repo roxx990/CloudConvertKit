@@ -1,0 +1,109 @@
+{
+  "data": {
+    "id": "3a93a100-eb4c-49b7-91a4-d18e0603c893",
+    "tag": "ebook-converter-ios",
+    "status": "finished",
+    "created_at": "2026-09-29T15:51:19+00:00",
+    "started_at": "2026-09-29T15:51:19+00:00",
+    "ended_at": "2026-09-29T15:51:26+00:00",
+    "tasks": [
+      {
+        "id": "fb3e46b9-a379-45d5-8cb4-4c0060aaef4a",
+        "name": "export",
+        "job_id": "3a93a100-eb4c-49b7-91a4-d18e0603c893",
+        "status": "finished",
+        "credits": 0,
+        "code": null,
+        "message": null,
+        "percent": 100,
+        "operation": "export/url",
+        "result": {
+          "files": [
+            {
+              "filename": "Sample PDF.rtf",
+              "size": 63297,
+              "url": "https://storage.cloudconvert.com/tasks/REDACTED/output.mobi?signature=REDACTED"
+            }
+          ]
+        },
+        "created_at": "2026-09-29T15:51:19+00:00",
+        "started_at": "2026-09-29T15:51:26+00:00",
+        "ended_at": "2026-09-29T15:51:26+00:00",
+        "retry_of_task_id": null,
+        "copy_of_task_id": null,
+        "user_id": 71148666,
+        "priority": 10,
+        "host_name": "chasity",
+        "storage": "ceph-fra",
+        "region": "eu-central",
+        "depends_on_task_ids": [
+          "d52a8e51-58a2-46af-97f2-e5450e46ce07"
+        ]
+      },
+      {
+        "id": "d52a8e51-58a2-46af-97f2-e5450e46ce07",
+        "name": "convert",
+        "job_id": "3a93a100-eb4c-49b7-91a4-d18e0603c893",
+        "status": "finished",
+        "credits": 4,
+        "code": null,
+        "message": null,
+        "percent": 100,
+        "operation": "convert",
+        "engine": "pdftron-pdf2word",
+        "engine_version": "12.0.0",
+        "result": {
+          "files": [
+            {
+              "filename": "Sample PDF.rtf",
+              "size": 63297
+            }
+          ]
+        },
+        "created_at": "2026-09-29T15:51:19+00:00",
+        "started_at": "2026-09-29T15:51:19+00:00",
+        "ended_at": "2026-09-29T15:51:26+00:00",
+        "retry_of_task_id": null,
+        "copy_of_task_id": null,
+        "user_id": 71148666,
+        "priority": 10,
+        "host_name": "chasity",
+        "storage": null,
+        "region": "eu-central",
+        "depends_on_task_ids": [
+          "bbc06a88-6c58-494a-a31c-51dde967673f"
+        ]
+      },
+      {
+        "id": "bbc06a88-6c58-494a-a31c-51dde967673f",
+        "name": "import",
+        "job_id": "3a93a100-eb4c-49b7-91a4-d18e0603c893",
+        "status": "finished",
+        "credits": 0,
+        "code": null,
+        "message": null,
+        "percent": 100,
+        "operation": "import/upload",
+        "result": {
+          "files": [
+            {
+              "filename": "Sample PDF.pdf",
+              "size": 20522
+            }
+          ]
+        },
+        "created_at": "2026-09-29T15:51:19+00:00",
+        "started_at": "2026-09-29T15:51:19+00:00",
+        "ended_at": "2026-09-29T15:51:19+00:00",
+        "retry_of_task_id": null,
+        "copy_of_task_id": null,
+        "user_id": 71148666,
+        "priority": 10,
+        "host_name": null,
+        "storage": "ceph-fra",
+        "region": "eu-central",
+        "depends_on_task_ids": []
+      }
+    ]
+  }
+}

@@ -21,6 +21,8 @@ final class ConversionEngineTests: XCTestCase {
         workingDirectory = TestFiles.temporaryDirectory()
         outputDirectory = TestFiles.temporaryDirectory()
         configuration = .testing(workingDirectory: workingDirectory, outputDirectory: outputDirectory)
+        let transfers = self.transfers!
+        api.serverHasUpload = { transfers.receivedUploadsSnapshot > 0 }
         engine = ConversionEngine(configuration: configuration, api: api, transfers: transfers, connectivity: AlwaysOnline())
     }
 
@@ -59,8 +61,8 @@ final class ConversionEngineTests: XCTestCase {
         XCTAssertEqual(api.createdSpecifications.count, 1)
         XCTAssertEqual(transfers.uploads.count, 1)
         XCTAssertEqual(transfers.downloads.count, 1)
-        await waitUntil { !self.api.deletedJobIDs.isEmpty }
-        XCTAssertEqual(api.deletedJobIDs.first, "job-1")
+        await waitUntil { !self.api.deletedJobIDsSnapshot.isEmpty }
+        XCTAssertEqual(api.deletedJobIDsSnapshot.first, "job-1")
 
         let observed = log.snapshot
         XCTAssertTrue(observed.contains(.creatingJob))
@@ -129,8 +131,8 @@ final class ConversionEngineTests: XCTestCase {
             XCTAssertFalse(error.isRetryable)
         }
         XCTAssertEqual(api.createdSpecifications.count, 1, "must not rebuild the job")
-        await waitUntil { !self.api.deletedJobIDs.isEmpty }
-        XCTAssertEqual(api.deletedJobIDs, ["job-1"])
+        await waitUntil { !self.api.deletedJobIDsSnapshot.isEmpty }
+        XCTAssertEqual(api.deletedJobIDsSnapshot, ["job-1"])
     }
 
     func testTransientJobFailureRebuildsJobOnce() async throws {
@@ -199,8 +201,8 @@ final class ConversionEngineTests: XCTestCase {
         } catch let error as CloudConvertError {
             guard case .cancelled = error else { return XCTFail("unexpected \(error)") }
         }
-        await waitUntil { !self.api.deletedJobIDs.isEmpty }
-        XCTAssertEqual(api.deletedJobIDs, ["job-1"])
+        await waitUntil { !self.api.deletedJobIDsSnapshot.isEmpty }
+        XCTAssertEqual(api.deletedJobIDsSnapshot, ["job-1"])
         let pending = await engine.pendingConversions()
         XCTAssertTrue(pending.isEmpty)
     }
@@ -344,7 +346,7 @@ final class ConversionEngineTests: XCTestCase {
         XCTAssertTrue(transfers.uploads.isEmpty, "the upload had already completed; it must not be repeated")
         XCTAssertTrue(api.createdSpecifications.isEmpty, "the existing job is reused, not recreated")
         XCTAssertEqual(transfers.downloads.count, 1)
-        await waitUntil { self.api.deletedJobIDs == ["job-9"] }
+        await waitUntil { self.api.deletedJobIDsSnapshot == ["job-9"] }
         let pending = await engine.pendingConversions()
         XCTAssertTrue(pending.isEmpty)
     }

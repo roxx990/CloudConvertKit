@@ -53,6 +53,13 @@ public struct FileStorage: Sendable {
     /// (document-picker URLs stop being readable once the picker's scope ends,
     /// and Photos exports live in temporary locations the system may purge).
     public func stage(_ input: InputFile, conversionID: String, limit: Int64) throws -> StagedInput {
+        try stage(input, conversionID: conversionID, taskName: nil, limit: limit)
+    }
+
+    /// `taskName` gives each upload task its own folder, so two inputs with
+    /// the same file name (`a/report.docx`, `b/report.docx`, or two Photos
+    /// exports named `image.jpeg`) never overwrite each other.
+    func stage(_ input: InputFile, conversionID: String, taskName: String?, limit: Int64) throws -> StagedInput {
         let source = input.url
         let accessing = source.startAccessingSecurityScopedResource()
         defer { if accessing { source.stopAccessingSecurityScopedResource() } }
@@ -67,11 +74,11 @@ public struct FileStorage: Sendable {
         guard size > 0 else { throw CloudConvertError.emptyFile(source) }
         guard size <= limit else { throw CloudConvertError.fileTooLarge(source, size: size, limit: limit) }
 
-        try ensureDirectory(stagingDirectory.appendingPathComponent(conversionID, isDirectory: true))
+        var directory = stagingDirectory.appendingPathComponent(conversionID, isDirectory: true)
+        if let taskName { directory.appendPathComponent(FileStorage.sanitizedFilename(taskName), isDirectory: true) }
+        try ensureDirectory(directory)
         let filename = FileStorage.sanitizedFilename(input.filename ?? source.lastPathComponent)
-        let destination = stagingDirectory
-            .appendingPathComponent(conversionID, isDirectory: true)
-            .appendingPathComponent(filename)
+        let destination = directory.appendingPathComponent(filename)
 
         try? FileManager.default.removeItem(at: destination)
         do {
@@ -122,13 +129,52 @@ public struct FileStorage: Sendable {
     public func finalize(downloadedFile: URL, preferredName: String, into directory: URL? = nil) throws -> URL {
         let directory = directory ?? outputDirectory
         try ensureDirectory(directory)
-        let destination = uniqueURL(in: directory, preferredName: FileStorage.sanitizedFilename(preferredName))
+        let destination = try reserveUniqueURL(in: directory, preferredName: FileStorage.sanitizedFilename(preferredName))
         do {
-            try FileManager.default.moveItem(at: downloadedFile, to: destination)
+            try FileStorage.move(downloadedFile, replacing: destination)
         } catch {
+            try? FileManager.default.removeItem(at: destination)
             throw CloudConvertError.storage(reason: "Could not move output into place: \(error.localizedDescription)")
         }
         return destination
+    }
+
+    /// Like `uniqueURL`, but claims the name by creating an empty file there
+    /// with `O_EXCL`, so two conversions finishing together can never pick the
+    /// same name. (Checking and then moving is not enough: the move ends in
+    /// `rename(2)`, which silently replaces a file created in between.)
+    func reserveUniqueURL(in directory: URL, preferredName: String) throws -> URL {
+        let base = (preferredName as NSString).deletingPathExtension
+        let ext = (preferredName as NSString).pathExtension
+        for counter in 1...10_000 {
+            let name = counter == 1 ? preferredName : (ext.isEmpty ? "\(base) (\(counter))" : "\(base) (\(counter)).\(ext)")
+            let candidate = directory.appendingPathComponent(name)
+            let descriptor = open(candidate.path, O_CREAT | O_EXCL | O_WRONLY, 0o644)
+            if descriptor >= 0 {
+                close(descriptor)
+                return candidate
+            }
+            guard errno == EEXIST else {
+                throw CloudConvertError.storage(reason: "Could not create \(name): \(String(cString: strerror(errno)))")
+            }
+        }
+        throw CloudConvertError.storage(reason: "No free file name for \(preferredName)")
+    }
+
+    /// Moves `source` onto `destination` (the placeholder reserved above),
+    /// replacing it atomically, including across volumes.
+    static func move(_ source: URL, replacing destination: URL) throws {
+        if rename(source.path, destination.path) == 0 { return }
+        guard errno == EXDEV else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        // Another volume: copy next to the destination, then swap it in.
+        let temporary = destination.deletingLastPathComponent().appendingPathComponent(".\(UUID().uuidString).partial")
+        try FileManager.default.copyItem(at: source, to: temporary)
+        guard rename(temporary.path, destination.path) == 0 else {
+            let code = POSIXErrorCode(rawValue: errno) ?? .EIO
+            try? FileManager.default.removeItem(at: temporary)
+            throw POSIXError(code)
+        }
+        try? FileManager.default.removeItem(at: source)
     }
 
     /// `name.ext` → `name (2).ext` → `name (3).ext`… until the path is free.

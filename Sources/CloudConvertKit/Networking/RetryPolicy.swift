@@ -51,11 +51,15 @@ public struct RetryPolicy: Equatable, Sendable {
 /// - Connectivity failures do **not** consume attempts; instead `waitForNetwork`
 ///   is awaited (the engine passes `ConnectivityMonitor.waitUntilConnected`).
 /// - A 429 with `Retry-After` overrides the computed delay.
+/// - `isSafeToRepeat`, when given, must also approve every repeat. Requests
+///   that are not idempotent (`POST /jobs`) pass one that only allows errors
+///   proving the server never processed the request.
 func retrying<T>(policy: RetryPolicy,
                  phase: ConversionPhase,
                  logger: any CloudConvertLogging,
                  label: String,
                  waitForNetwork: (@Sendable () async throws -> Void)? = nil,
+                 isSafeToRepeat: (@Sendable (CloudConvertError) -> Bool)? = nil,
                  onRetry: (@Sendable (_ attempt: Int, _ delay: TimeInterval, _ error: CloudConvertError) async -> Void)? = nil,
                  operation: @Sendable () async throws -> T) async throws -> T {
     var attempt = 0
@@ -68,17 +72,21 @@ func retrying<T>(policy: RetryPolicy,
         } catch {
             let ccError = CloudConvertError.wrap(error, phase: phase)
             if case .cancelled = ccError { throw ccError }
+            let safeToRepeat = isSafeToRepeat?(ccError) ?? true
 
             // Offline: wait for the network instead of burning attempts.
-            if ccError.isConnectivityRelated, let waitForNetwork, offlineWaits < 3 {
+            if ccError.isConnectivityRelated, safeToRepeat, let waitForNetwork, offlineWaits < 3 {
                 offlineWaits += 1
                 logger.notice("\(label): offline (\(ccError.analyticsCode)); waiting for connectivity", metadata: ["phase": phase.rawValue])
                 try await waitForNetwork()
+                // The wait returns at once when the path is up but the host is
+                // unreachable; back off instead of re-sending immediately.
+                try await Task.sleep(nanoseconds: UInt64(policy.delay(forAttempt: offlineWaits) * 1_000_000_000))
                 continue
             }
 
             attempt += 1
-            guard ccError.isRetryable, policy.shouldRetry(afterAttempt: attempt) else {
+            guard ccError.isRetryable, safeToRepeat, policy.shouldRetry(afterAttempt: attempt) else {
                 logger.error("\(label): giving up after \(attempt) attempt(s): \(ccError.analyticsCode)", metadata: ["phase": phase.rawValue])
                 throw ccError
             }
