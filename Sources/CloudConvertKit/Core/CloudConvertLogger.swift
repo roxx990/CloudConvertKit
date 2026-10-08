@@ -12,6 +12,10 @@ public enum LogLevel: Int, Comparable, Sendable {
 }
 
 public protocol CloudConvertLogging: Sendable {
+    /// `message` is operational: ids, phases, status and analytics codes.
+    /// Anything that can identify what the user converts (file names, the
+    /// server's messages, response bodies) comes in `metadata`, which the
+    /// default logger records as private.
     func log(_ level: LogLevel, _ message: @autoclosure () -> String, metadata: [String: String])
 }
 
@@ -33,7 +37,9 @@ public extension CloudConvertLogging {
     }
 }
 
-/// Default logger backed by `os.Logger`.
+/// Default logger backed by `os.Logger`. Messages are public; metadata is
+/// private, so it reads `<private>` unless private data is enabled (for
+/// example while the debugger is attached).
 public struct OSLogCloudConvertLogger: CloudConvertLogging {
 
     private let logger: Logger
@@ -48,17 +54,19 @@ public struct OSLogCloudConvertLogger: CloudConvertLogging {
 
     public func log(_ level: LogLevel, _ message: @autoclosure () -> String, metadata: [String: String]) {
         guard level >= minimumLevel else { return }
-        let suffix = metadata.isEmpty ? "" : " " + metadata
-            .sorted { $0.key < $1.key }
-            .map { "\($0.key)=\($0.value)" }
-            .joined(separator: " ")
-        let text = message() + suffix
+        let type: OSLogType
         switch level {
-        case .debug: logger.debug("\(text, privacy: .public)")
-        case .info: logger.info("\(text, privacy: .public)")
-        case .notice: logger.notice("\(text, privacy: .public)")
-        case .warning: logger.warning("\(text, privacy: .public)")
-        case .error: logger.error("\(text, privacy: .public)")
+        case .debug: type = .debug
+        case .info: type = .info
+        case .notice: type = .default
+        case .warning, .error: type = .error
+        }
+        let text = message()
+        if metadata.isEmpty {
+            logger.log(level: type, "\(text, privacy: .public)")
+        } else {
+            let details = metadata.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " ")
+            logger.log(level: type, "\(text, privacy: .public) \(details, privacy: .private)")
         }
     }
 }

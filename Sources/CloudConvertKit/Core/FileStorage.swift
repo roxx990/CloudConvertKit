@@ -91,6 +91,10 @@ public struct FileStorage: Sendable {
             if let coordinatorError { throw coordinatorError }
             if let copyError { throw copyError }
         } catch {
+            // A full disk is not an unreadable file.
+            if case .insufficientDiskSpace = CloudConvertError.wrap(error, phase: .preparing) {
+                throw CloudConvertError.insufficientDiskSpace(required: size, available: availableCapacity())
+            }
             throw CloudConvertError.fileNotReadable(source, underlying: error.localizedDescription)
         }
 
@@ -116,7 +120,7 @@ public struct FileStorage: Sendable {
     }
 
     public func ensureDiskSpace(forExpectedBytes bytes: Int64) throws {
-        let required = bytes + safetyMargin
+        let required = [bytes, safetyMargin].saturatingSum()
         let available = availableCapacity()
         guard available >= required else {
             throw CloudConvertError.insufficientDiskSpace(required: required, available: available)

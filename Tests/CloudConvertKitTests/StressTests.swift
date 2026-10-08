@@ -3,11 +3,14 @@
 //  decode its JSON), with seeded faults at every layer: failed and ambiguous
 //  job creation, upload 5xx, uploads whose response is lost, single-use upload
 //  forms, poll errors, undecodable responses, purged jobs, task failures,
-//  failed downloads, and cancellation at random moments.
+//  failed downloads, and cancellation at random moments. Some conversions
+//  lose the network once their input is uploaded: they must be kept, and
+//  are resumed when it comes back.
 //
 //  Afterwards it checks invariants that must hold whatever happened:
 //  every conversion ends exactly once, nothing is reported after the end,
 //  no conversion is billed twice, deterministic failures are tried once,
+//  exactly the conversions that may still be billed are kept for a resume,
 //  every job the engine knows about is deleted, and no local state is left.
 //
 //  Reproduce a run with CCK_STRESS_SEED=<seed>; scale with CCK_STRESS_COUNT.
@@ -44,6 +47,7 @@ final class Dice: @unchecked Sendable {
 /// What a job does once its input has arrived.
 enum JobFate: String, CaseIterable {
     case finish              // converts, billed
+    case offline             // converts, billed, but polls find the device offline until the network comes back
     case conversionFailed    // engine cannot convert: `code: null`
     case transientFailure    // `code: TIMEOUT`, worth a new job
     case undecodable         // every poll returns something unparseable
@@ -73,10 +77,12 @@ final class ChaosCloud: CloudConvertAPIClient, @unchecked Sendable {
     private var attempts: [String: Int] = [:]
     private(set) var jobs: [String: Job] = [:]
     private var nextID = 0
+    private var networkIsBack = false
 
     init(dice: Dice) { self.dice = dice }
 
     func plan(tag: String, fates: [JobFate]) { lock.lock(); plans[tag] = fates; lock.unlock() }
+    func restoreNetwork() { lock.lock(); networkIsBack = true; lock.unlock() }
     var snapshot: [Job] { lock.lock(); defer { lock.unlock() }; return Array(jobs.values) }
 
     private func latency() async { try? await Task.sleep(nanoseconds: UInt64(dice.int(0...3)) * 1_000_000) }
@@ -111,11 +117,13 @@ final class ChaosCloud: CloudConvertAPIClient, @unchecked Sendable {
         if arrived { job.polls += 1 }
         jobs[id] = job
         let transient = dice.chance(0.04)
+        let offline = !networkIsBack
         let json = jsonLocked(id)
         lock.unlock()
         if transient { throw CloudConvertError.serverError(status: 502, nil) }
         if arrived {
             switch job.fate {
+            case .offline where offline: throw CloudConvertError.notConnected
             case .undecodable: throw CloudConvertError.decoding(reason: "getJob: not JSON")
             case .serverDown: throw CloudConvertError.serverError(status: 503, nil)
             case .purged: throw CloudConvertError.notFound(nil)
@@ -141,7 +149,7 @@ final class ChaosCloud: CloudConvertAPIClient, @unchecked Sendable {
             return 400
         }
         job.uploadsReceived = 1
-        if job.fate == .finish { job.billed = true }
+        if job.fate == .finish || job.fate == .offline { job.billed = true }
         jobs[jobID] = job
         return 201
     }
@@ -161,7 +169,7 @@ final class ChaosCloud: CloudConvertAPIClient, @unchecked Sendable {
         switch (arrived, done, job.fate) {
         case (false, _, _): status = "waiting"
         case (true, false, _): status = "processing"
-        case (true, true, .finish): status = "finished"
+        case (true, true, .finish), (true, true, .offline): status = "finished"
         case (true, true, _): status = "error"
         }
         var tasks: [[String: Any]] = []
@@ -269,6 +277,12 @@ final class StressTests: XCTestCase {
         let cancelled: Bool
         let result: Result<ConversionResult, Error>
         let stages: [ConversionProgress.Stage]
+        var resumed = false
+
+        var isResumable: Bool {
+            guard case .failure(let error) = result else { return false }
+            return (error as? CloudConvertError)?.isResumable == true
+        }
     }
 
     func testRandomisedEndToEndInvariants() async throws {
@@ -287,13 +301,14 @@ final class StressTests: XCTestCase {
         configuration.uploadRetryPolicy = RetryPolicy(maxAttempts: 3, baseDelay: 0.002, maxDelay: 0.005, jitter: 0)
         configuration.downloadRetryPolicy = RetryPolicy(maxAttempts: 3, baseDelay: 0.002, maxDelay: 0.005, jitter: 0)
         let cloud = ChaosCloud(dice: dice)
+        let network = DroppedNetwork()
         let engine = ConversionEngine(configuration: configuration, api: cloud,
-                                      transfers: ChaosTransfers(cloud: cloud, dice: dice), connectivity: AlwaysOnline())
+                                      transfers: ChaosTransfers(cloud: cloud, dice: dice), connectivity: network)
         let inputs = TestFiles.temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: inputs) }
 
         // Mostly successes, with every kind of failure well represented.
-        let weighted: [JobFate] = [.finish, .finish, .finish, .finish, .conversionFailed, .transientFailure,
+        let weighted: [JobFate] = [.finish, .finish, .finish, .finish, .offline, .conversionFailed, .transientFailure,
                                    .undecodable, .serverDown, .purged]
 
         let outcomes = try await withThrowingTaskGroup(of: Outcome.self) { group -> [Outcome] in
@@ -332,19 +347,44 @@ final class StressTests: XCTestCase {
             return all
         }
 
+        // The network comes back. Exactly the kept conversions are pending,
+        // and resuming them is the end of them.
+        let kept = outcomes.filter(\.isResumable)
+        for outcome in kept {
+            XCTAssertEqual(outcome.stages.filter(\.isTerminal), [.failed], "kept: \(outcome.tag) seed=\(seed)")
+        }
+        cloud.restoreNetwork()
+        network.isBack = true
+        let pendingTags = Dictionary(uniqueKeysWithValues: await engine.pendingConversions().map { ($0.id, $0.specification.tag ?? "-") })
+        XCTAssertEqual(Set(pendingTags.values), Set(kept.map(\.tag)), "pending after the first run (seed \(seed))")
+        var finals = Dictionary(uniqueKeysWithValues: outcomes.map { ($0.tag, $0) })
+        for handle in await engine.resumePendingConversions() {
+            guard let tag = pendingTags[handle.id], let first = finals[tag] else { XCTFail("resumed \(handle.id)"); continue }
+            let log = StageLog()
+            let observer = Task { for await progress in handle.progress { log.append(progress.stage) } }
+            let task = Task { try await handle.result }
+            let result = await withTimeout(seconds: 60) { await task.result }
+            _ = await withTimeout(seconds: 5) { await observer.value }
+            XCTAssertNotNil(result, "resumed conversion \(tag) never finished (seed \(seed))")
+            finals[tag] = Outcome(tag: tag, fates: first.fates, cancelled: false,
+                                  result: result ?? .failure(CloudConvertError.jobTimedOut(jobID: "hang")),
+                                  stages: log.snapshot, resumed: true)
+        }
+
         // Let detached remote deletions and late shielded creations settle.
         try await Task.sleep(nanoseconds: 300_000_000)
         let jobs = cloud.snapshot
         let jobsByTag = Dictionary(grouping: jobs, by: \.tag)
-        var tally: [String: Int] = [:]
+        var tally: [String: Int] = ["kept": kept.count]
 
-        for outcome in outcomes {
-            let context = "\(outcome.tag) fates=\(outcome.fates.map(\.rawValue)) cancelled=\(outcome.cancelled) seed=\(seed)"
+        for outcome in finals.values {
+            let context = "\(outcome.tag) fates=\(outcome.fates.map(\.rawValue)) cancelled=\(outcome.cancelled) resumed=\(outcome.resumed) seed=\(seed)"
             let mine = jobsByTag[outcome.tag] ?? []
 
-            // 1. Exactly one terminal stage, and nothing after it.
+            // 1. Exactly one terminal stage, and nothing after it. (A resumed
+            //    run is watched through its coalescing stream: its last stage.)
             let terminals = outcome.stages.filter(\.isTerminal)
-            XCTAssertEqual(terminals.count, 1, "terminal stages \(terminals): \(context)")
+            if !outcome.resumed { XCTAssertEqual(terminals.count, 1, "terminal stages \(terminals): \(context)") }
             XCTAssertTrue(outcome.stages.last?.isTerminal ?? false, "last stage \(String(describing: outcome.stages.last)): \(context)")
 
             // 2. Never billed twice; never more jobs than the retry policy allows
@@ -362,7 +402,14 @@ final class StressTests: XCTestCase {
                 XCTAssertEqual(dead, ordered.count - 1, "rebuilt after a deterministic failure: \(context)")
             }
 
-            // 5. The outcome matches what happened.
+            // 5. Losing the network once the job has the input never throws
+            //    the conversion away: it is kept, and resumed.
+            if case .failure(let error) = outcome.result, (error as? CloudConvertError)?.isConnectivityRelated == true,
+               let last = ordered.last, last.fate == .offline, last.uploadsReceived > 0 {
+                XCTFail("lost to the network after its input was uploaded: \(context)")
+            }
+
+            // 6. The outcome matches what happened.
             switch outcome.result {
             case .success(let result):
                 XCTAssertEqual(outcome.stages.last, .completed, context)
@@ -372,6 +419,7 @@ final class StressTests: XCTestCase {
             case .failure(let error):
                 let ccError = error as? CloudConvertError
                 XCTAssertNotNil(ccError, "not a CloudConvertError: \(error) \(context)")
+                XCTAssertFalse(ccError?.isResumable == true, "still kept with the network back: \(context)")
                 if ccError?.isCancellation == true {
                     XCTAssertEqual(outcome.stages.last, .cancelled, context)
                     tally["cancelled", default: 0] += 1
@@ -382,11 +430,11 @@ final class StressTests: XCTestCase {
             }
         }
 
-        // 6. Every job the engine learnt about is deleted from CloudConvert.
+        // 7. Every job the engine learnt about is deleted from CloudConvert.
         let leaked = jobs.filter { !$0.responseLost && !$0.deleted }
         XCTAssertTrue(leaked.isEmpty, "jobs left on CloudConvert: \(leaked.map { "\($0.id)(\($0.tag))" }) seed=\(seed)")
 
-        // 7. No local state left behind.
+        // 8. No local state left behind.
         let pending = await engine.pendingConversions()
         XCTAssertTrue(pending.isEmpty, "records left: \(pending.map(\.id))")
         let storage = FileStorage(workingDirectory: work, outputDirectory: out, diskSpaceSafetyMargin: 0)

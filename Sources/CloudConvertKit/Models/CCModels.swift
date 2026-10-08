@@ -181,7 +181,7 @@ public struct CCUploadForm: Decodable, Equatable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        url = try container.decode(URL.self, forKey: .url)
+        url = try CCLenient.url(container, .url)
         let ordered = try container.decode(OrderedStringDictionary.self, forKey: .parameters)
         parameters = ordered.pairs
     }
@@ -213,6 +213,9 @@ public struct CCUploadForm: Decodable, Equatable, Sendable {
         return ISO8601DateFormatter().date(from: raw)
     }
 
+    /// Whether `expiresAt` has passed, or is less than 30 seconds away, by
+    /// the device clock. The device clock can be wrong, so the engine only
+    /// asks this of a form a previous launch received, never of a fresh one.
     public var isExpired: Bool {
         guard let expiresAt else { return false }
         // Keep a small margin so we never start an upload that expires mid-flight.
@@ -237,7 +240,7 @@ public struct CCExportedFile: Decodable, Equatable, Sendable {
         } else {
             size = nil
         }
-        url = try container.decode(URL.self, forKey: .url)
+        url = try CCLenient.url(container, .url)
     }
 
     public init(filename: String, size: Int64?, url: URL) {
@@ -406,9 +409,23 @@ extension CCPage: Equatable where Item: Equatable {}
 enum CCLenient {
     static func int<K: CodingKey>(_ container: KeyedDecodingContainer<K>, _ key: K) -> Int? {
         if let value = try? container.decodeIfPresent(Int.self, forKey: key) { return value }
-        if let value = try? container.decodeIfPresent(Double.self, forKey: key) { return Int(value) }
-        if let text = try? container.decodeIfPresent(String.self, forKey: key) { return Int(text) ?? Double(text).map { Int($0) } }
+        if let value = try? container.decodeIfPresent(Double.self, forKey: key) { return int(value) }
+        if let text = try? container.decodeIfPresent(String.self, forKey: key) { return Int(text) ?? Double(text).flatMap(int) }
         return nil
+    }
+
+    /// `Int(value)` without the trap: `nil` for NaN, infinity and numbers out
+    /// of range, which a server can send (`1e20`, `"inf"`). Fractions truncate.
+    static func int(_ value: Double) -> Int? {
+        Int(exactly: value.rounded(.towardZero))
+    }
+
+    /// A URL parsed the same way on every supported system (`URL(lenient:)`).
+    static func url<K: CodingKey>(_ container: KeyedDecodingContainer<K>, _ key: K) throws -> URL {
+        guard let url = URL(lenient: try container.decode(String.self, forKey: key)) else {
+            throw DecodingError.dataCorruptedError(forKey: key, in: container, debugDescription: "Invalid URL")
+        }
+        return url
     }
 
     static func bool<K: CodingKey>(_ container: KeyedDecodingContainer<K>, _ key: K) -> Bool? {
@@ -464,6 +481,43 @@ struct OrderedStringDictionary: Decodable {
         }
         if let signature { ordered.append(("signature", signature)) }
         pairs = ordered
+    }
+}
+
+extension URL {
+    /// Parses `string` the way iOS 17 and macOS 14 do, on every supported
+    /// system. Those percent-encode the characters that are invalid in a URL
+    /// (a space, non-ASCII, `|`, `[]` outside the host, a `%` that starts no
+    /// escape, a `#` inside the fragment); older systems return `nil`
+    /// instead, which dropped the file.
+    init?(lenient string: String) {
+        guard let url = URL(string: string) ?? URL(string: URL.encodingInvalidCharacters(string)) else { return nil }
+        self = url
+    }
+
+    static func encodingInvalidCharacters(_ string: String) -> String {
+        let text = string.replacingOccurrences(of: "%(?![0-9A-Fa-f]{2})", with: "%25", options: .regularExpression)
+        // `[]` delimit an IPv6 host, so only the scheme and authority keep
+        // them; and only the first `#` starts the fragment.
+        let authorityStart = text.range(of: "://")?.upperBound ?? text.startIndex
+        let authorityEnd = text[authorityStart...].firstIndex { "/?#".contains($0) } ?? text.endIndex
+        let fragmentStart = text[authorityEnd...].firstIndex(of: "#")
+        let valid = CharacterSet.urlFragmentAllowed.union(CharacterSet(charactersIn: "%"))
+        let head = text[..<authorityEnd].addingPercentEncoding(withAllowedCharacters: valid.union(CharacterSet(charactersIn: "[]")))
+        let path = text[authorityEnd..<(fragmentStart ?? text.endIndex)].addingPercentEncoding(withAllowedCharacters: valid)
+        let fragment = fragmentStart.map { "#" + (text[text.index(after: $0)...].addingPercentEncoding(withAllowedCharacters: valid) ?? "") }
+        return (head ?? "") + (path ?? "") + (fragment ?? "")
+    }
+}
+
+extension Sequence where Element: FixedWidthInteger {
+    /// The sum, saturating at `.max` or `.min` instead of trapping: sizes and
+    /// credits come from the server, and two absurd values must not crash.
+    func saturatingSum() -> Element {
+        reduce(0) { sum, value in
+            let (result, overflow) = sum.addingReportingOverflow(value)
+            return overflow ? (value > 0 ? .max : .min) : result
+        }
     }
 }
 

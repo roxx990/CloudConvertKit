@@ -224,8 +224,9 @@ public final class CloudConvertAPI: CloudConvertAPIClient, @unchecked Sendable {
         do {
             return try decoder.decode(T.self, from: response.body)
         } catch {
+            // The body can hold file names and signed URLs: metadata, which the default logger keeps private.
             let snippet = String(data: response.body.prefix(300), encoding: .utf8) ?? "<binary>"
-            logger.error("\(label): could not decode response: \(error) body=\(snippet)")
+            logger.error("\(label): could not decode response: \(error)", metadata: ["body": snippet])
             throw CloudConvertError.decoding(reason: "\(label): \(error)")
         }
     }

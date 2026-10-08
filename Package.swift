@@ -16,7 +16,8 @@ let package = Package(
     targets: [
         .target(
             name: "CloudConvertKit",
-            path: "Sources/CloudConvertKit"
+            path: "Sources/CloudConvertKit",
+            resources: [.copy("PrivacyInfo.xcprivacy")]
         ),
         .target(
             name: "CloudConvertKitUI",
@@ -25,7 +26,7 @@ let package = Package(
         ),
         .testTarget(
             name: "CloudConvertKitTests",
-            dependencies: ["CloudConvertKit"],
+            dependencies: ["CloudConvertKit", "CloudConvertKitUI"],
             path: "Tests/CloudConvertKitTests",
             // Real `GET /v2/jobs/{id}` responses (signed URLs redacted).
             resources: [.copy("Fixtures")]

@@ -51,6 +51,11 @@ final class FakeAPI: CloudConvertAPIClient, @unchecked Sendable {
     /// Awaited inside `createJob` after the job was created server-side and
     /// before the response arrives (e.g. to cancel mid-request).
     var createJobHook: (@Sendable (_ jobID: String) async throws -> Void)?
+    /// Awaited at the start of every `getJob` (e.g. to hang one call).
+    var getJobHook: (@Sendable (_ jobID: String) async throws -> Void)?
+    /// Seconds from now, by the device clock, until upload forms expire.
+    /// Negative: the device clock runs that far ahead of the server's.
+    var formExpiresIn: TimeInterval = 3600
     var createdJobIDs: [String] {
         lock.lock(); defer { lock.unlock() }
         return (0..<createdJobCount).map { "job-\($0 + 1)" }
@@ -59,7 +64,10 @@ final class FakeAPI: CloudConvertAPIClient, @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return deletedJobIDs
     }
+    /// Every job id `getJob` was asked for, in order.
+    var polledJobIDs: [String] { locked { polled } }
     private(set) var pollCount = 0
+    private var polled: [String] = []
     private var statusIndex = 0
     private var createdJobCount = 0
 
@@ -78,19 +86,27 @@ final class FakeAPI: CloudConvertAPIClient, @unchecked Sendable {
     }
 
     func getJob(id: String) async throws -> CCJob {
+        if let hook = locked({ getJobHook }) { try await hook(id) }
+        return try locked {
+            pollCount += 1
+            polled.append(id)
+            if getJobAlwaysUndecodable {
+                throw CloudConvertError.decoding(reason: "getJob: DecodingError.dataCorrupted: not JSON")
+            }
+            if !getJobErrors.isEmpty { throw getJobErrors.removeFirst() }
+            guard let spec = createdSpecifications.last ?? seededSpecification else {
+                throw CloudConvertError.notFound(nil)
+            }
+            let script = jobStatusScripts[max(0, min(createdJobCount - 1, jobStatusScripts.count - 1))]
+            let status = script[min(statusIndex, script.count - 1)]
+            statusIndex += 1
+            return try makeJob(id: id, specification: spec, status: status, includeForms: true)
+        }
+    }
+
+    private func locked<T>(_ body: () throws -> T) rethrows -> T {
         lock.lock(); defer { lock.unlock() }
-        pollCount += 1
-        if getJobAlwaysUndecodable {
-            throw CloudConvertError.decoding(reason: "getJob: DecodingError.dataCorrupted: not JSON")
-        }
-        if !getJobErrors.isEmpty { throw getJobErrors.removeFirst() }
-        guard let spec = createdSpecifications.last ?? seededSpecification else {
-            throw CloudConvertError.notFound(nil)
-        }
-        let script = jobStatusScripts[max(0, min(createdJobCount - 1, jobStatusScripts.count - 1))]
-        let status = script[min(statusIndex, script.count - 1)]
-        statusIndex += 1
-        return try makeJob(id: id, specification: spec, status: status, includeForms: true)
+        return try body()
     }
 
     func deleteJob(id: String) async throws {
@@ -128,7 +144,7 @@ final class FakeAPI: CloudConvertAPIClient, @unchecked Sendable {
             ]
             if task.isUpload, includeForms {
                 object["result"] = ["form": ["url": "https://upload.example/\(task.name)",
-                                             "parameters": ["expires": "\(Int(Date().timeIntervalSince1970) + 3600)",
+                                             "parameters": ["expires": "\(Int(Date().timeIntervalSince1970 + formExpiresIn))",
                                                             "max_file_size": "10000000000",
                                                             "signature": "sig"]]]
             }
@@ -213,12 +229,31 @@ final class FakeTransfers: FileTransferring, @unchecked Sendable {
         return TransferOutcome(status: status, responseBody: nil, fileURL: fileURL, errorDescription: nil, urlErrorCode: nil, finishedAt: Date())
     }
 
+    /// Transfers a previous launch started, as `awaitExistingTransfer` finds
+    /// them: what re-attaching to one returns or throws (a `BackgroundTransferManager`
+    /// throws for a failure it saw happen, and returns the outcome of one that
+    /// finished while the app was not running). `nil`: every one is lost.
+    var reattach: (@Sendable (_ id: String) async throws -> TransferOutcome)?
+    /// Ids the engine tried to re-attach to.
+    var reattached: [String] { locked { reattachedIDs } }
+    private var reattachedIDs: [String] = []
+
     func awaitExistingTransfer(id: String, progress: @escaping @Sendable (TransferProgress) -> Void) async throws -> TransferOutcome {
-        throw CloudConvertError.transferLost(id: id)
+        let script = locked { () -> (@Sendable (String) async throws -> TransferOutcome)? in
+            reattachedIDs.append(id)
+            return reattach
+        }
+        guard let script else { throw CloudConvertError.transferLost(id: id) }
+        return try await script(id)
     }
 
     func cancel(id: String) { lock.lock(); cancelled.append(id); lock.unlock() }
     func forget(id: String) {}
+
+    private func locked<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock(); defer { lock.unlock() }
+        return try body()
+    }
 }
 
 // MARK: - Connectivity fakes
@@ -238,6 +273,26 @@ struct AlwaysOffline: ConnectivityMonitoring {
     func changes() -> AsyncStream<Bool> { AsyncStream { $0.yield(false); $0.finish() } }
 }
 
+/// Online when work starts, then the network drops: requests fail through
+/// the API's scripted errors, and every wait for the network times out
+/// until the test sets `isBack`.
+final class DroppedNetwork: ConnectivityMonitoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private var back = false
+
+    var isBack: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return back }
+        set { lock.lock(); back = newValue; lock.unlock() }
+    }
+
+    var isConnected: Bool { get async { true } }
+    var isExpensive: Bool { get async { false } }
+    func waitUntilConnected(timeout: TimeInterval) async throws {
+        guard isBack else { throw CloudConvertError.notConnected }
+    }
+    func changes() -> AsyncStream<Bool> { AsyncStream { $0.yield(true); $0.finish() } }
+}
+
 // MARK: - Helpers
 
 /// Thread-safe collector for progress stages (progress handlers are `@Sendable`).
@@ -253,6 +308,20 @@ final class StageLog: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return stages
     }
+}
+
+/// Keeps every log line, to check what reaches messages and metadata.
+final class LogRecorder: CloudConvertLogging, @unchecked Sendable {
+    private let lock = NSLock()
+    private var lines: [(message: String, metadata: [String: String])] = []
+
+    func log(_ level: LogLevel, _ message: @autoclosure () -> String, metadata: [String: String]) {
+        let line = (message(), metadata)
+        lock.lock(); lines.append(line); lock.unlock()
+    }
+
+    var messages: [String] { lock.lock(); defer { lock.unlock() }; return lines.map(\.message) }
+    var metadataValues: [String] { lock.lock(); defer { lock.unlock() }; return lines.flatMap { $0.metadata.values } }
 }
 
 enum TestFiles {

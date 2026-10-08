@@ -192,7 +192,7 @@ final class ConversionEngineTests: XCTestCase {
         transfers.uploadDelay = 1
         let request = try makeRequest()
         let handle = engine.start(request)
-        try await Task.sleep(nanoseconds: 100_000_000)
+        await waitUntil { !self.transfers.uploads.isEmpty }    // uploading: the job exists
         handle.cancel()
 
         do {

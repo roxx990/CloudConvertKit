@@ -61,6 +61,7 @@ public final class ConversionViewModel: ObservableObject {
 
     private let engine: ConversionEngine
     private let queue: ConversionQueue
+    private var handles: [String: ConversionHandle] = [:]
     private var observers: [String: Task<Void, Never>] = [:]
 
     public init(engine: ConversionEngine, maxConcurrent: Int? = nil) {
@@ -94,35 +95,47 @@ public final class ConversionViewModel: ObservableObject {
     }
 
     public func cancel(id: String) {
-        Task { await queue.cancel(id: id) }
+        if let handle = handles[id] {
+            handle.cancel()
+        } else {
+            update(id) { if $0.state == .queued { $0.state = .cancelled } }    // still being resumed: `resume` stops it
+        }
     }
 
     public func cancelAll() {
-        Task { await queue.cancelAll() }
+        items.forEach { cancel(id: $0.id) }
     }
 
-    /// Re-runs a failed or cancelled item with the same request.
+    /// Re-runs a failed or cancelled item with the same request. An item that
+    /// stopped with a resumable error (`CloudConvertError.isResumable`) is
+    /// resumed instead: its job is still on CloudConvert, and running the
+    /// request again would convert, and bill, the file a second time. If the
+    /// app already resumed it (`resumePendingConversions()`), the item
+    /// follows that run, or shows its result.
     public func retry(id: String) {
         guard let index = items.firstIndex(where: { $0.id == id }), items[index].state.isFinished else { return }
-        let request = items[index].request
-        items.remove(at: index)
-        observers[id]?.cancel()
-        observers[id] = nil
-        Task { await enqueue(request) }
+        let item = items[index]
+        forget(id)
+        if item.error?.isResumable == true {
+            items[index] = Item(id: id, request: item.request, state: .queued)
+            Task { await resume(item) }
+        } else {
+            items.remove(at: index)
+            Task { await enqueue(item.request) }
+        }
     }
 
     public func remove(id: String) {
         cancel(id: id)
+        discardResumable(items.filter { $0.id == id })
         items.removeAll { $0.id == id }
-        observers[id]?.cancel()
-        observers[id] = nil
+        forget(id)
     }
 
     public func clearFinished() {
-        for item in items where item.state.isFinished {
-            observers[item.id]?.cancel()
-            observers[item.id] = nil
-        }
+        let finished = items.filter(\.state.isFinished)
+        finished.forEach { forget($0.id) }
+        discardResumable(finished)
         items.removeAll { $0.state.isFinished }
     }
 
@@ -131,18 +144,44 @@ public final class ConversionViewModel: ObservableObject {
     private func enqueue(_ request: ConversionRequest) async {
         let handle = await queue.enqueue(request)
         items.append(Item(id: handle.id, request: request, state: .queued))
+        observe(handle)
+    }
 
+    private func resume(_ item: Item) async {
+        let id = item.id
+        let handle = await engine.resumePendingConversions(where: { $0.id == id }).first ?? engine.resumedConversion(id: id)
+        guard items.first(where: { $0.id == id })?.state == .queued else {
+            handle?.cancel()        // removed or cancelled meanwhile
+            return
+        }
+        guard let handle else {
+            // Neither kept nor resumed: it was discarded, or failed. Start over.
+            items.removeAll { $0.id == id }
+            await enqueue(item.request)
+            return
+        }
+        observe(handle)
+    }
+
+    /// A conversion that stopped with a resumable error is kept for a
+    /// resume. Removing its item gives it up, so its record and job go too.
+    private func discardResumable(_ removed: [Item]) {
+        let ids = removed.filter { $0.error?.isResumable == true }.map(\.id)
+        guard !ids.isEmpty else { return }
+        Task { for id in ids { await engine.discardPendingConversion(id: id) } }
+    }
+
+    private func observe(_ handle: ConversionHandle) {
+        handles[handle.id] = handle
         observers[handle.id] = Task { [weak self] in
             for await progress in handle.progress {
                 guard let self else { return }
                 self.update(handle.id) { item in
                     item.progress = progress
-                    switch progress.stage {
-                    case .completed: item.state = .succeeded
-                    case .failed: item.state = .failed
-                    case .cancelled: item.state = .cancelled
-                    default: item.state = .running
-                    }
+                    // The final state is set below, with the result or error:
+                    // `retry(id:)` must not see `.failed` before knowing
+                    // whether the error is resumable.
+                    if !progress.stage.isTerminal { item.state = .running }
                 }
             }
             do {
@@ -159,6 +198,12 @@ public final class ConversionViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    private func forget(_ id: String) {
+        handles[id] = nil
+        observers[id]?.cancel()
+        observers[id] = nil
     }
 
     private func update(_ id: String, _ body: (inout Item) -> Void) {

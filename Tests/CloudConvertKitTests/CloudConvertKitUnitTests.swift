@@ -107,7 +107,10 @@ final class ErrorClassificationTests: XCTestCase {
         let validation = HTTPErrorMapper.error(for: HTTPResponse(status: 422, headers: [:],
             body: Data(#"{"message":"Invalid","code":"INVALID_DATA","errors":{"tasks.convert.output_format":["unsupported"]}}"#.utf8)))
         XCTAssertFalse(validation.isRetryable)
-        XCTAssertTrue(validation.userFacingMessage.contains("unsupported"))
+        // The server's text stays in the payload, for logs; the user never sees it.
+        XCTAssertFalse(validation.userFacingMessage.contains("unsupported"))
+        guard case .validation(let payload) = validation else { return XCTFail("expected validation") }
+        XCTAssertTrue(payload?.flattenedErrors?.contains("unsupported") == true)
 
         XCTAssertTrue(HTTPErrorMapper.error(for: HTTPResponse(status: 503, headers: [:], body: Data())).isRetryable)
         XCTAssertFalse(HTTPErrorMapper.error(for: HTTPResponse(status: 401, headers: [:], body: Data())).isRetryable)

@@ -69,7 +69,14 @@ public actor ConversionQueue {
 
         let task = Task<ConversionResult, Error> {
             defer { continuation.finish() }
-            try await self.acquireSlot()
+            do {
+                try await self.acquireSlot()
+            } catch {
+                // Cancelled while queued: it never started, but still ends
+                // with exactly one terminal stage.
+                continuation.yield(ConversionProgress(conversionID: conversionID, stage: .cancelled, fractionCompleted: 0))
+                throw error
+            }
             defer { self.releaseSlot() }        // the Task inherits the actor's isolation
             return try await body(conversionID) { continuation.yield($0) }
         }

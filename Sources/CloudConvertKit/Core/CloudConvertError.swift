@@ -151,6 +151,9 @@ public enum CloudConvertError: Error, Sendable {
     // Connectivity
     case notConnected
     case network(code: URLError.Code, description: String)
+    /// A request timed out in `phase`. With `phase == .waitingForNetwork`, a
+    /// conversion waited longer than `offlineWaitTimeout` for the network
+    /// after its job was created, and was kept to resume (`isResumable`).
     case timedOut(phase: ConversionPhase)
     case cancelled
 
@@ -179,7 +182,9 @@ public enum CloudConvertError: Error, Sendable {
     // Job / task level
     case jobFailed(jobID: String, taskName: String?, code: TaskFailureCode, message: String?)
     case jobLost(jobID: String)          // job disappeared server-side (24h purge / deleted)
-    case jobTimedOut(jobID: String)      // exceeded the configured overall deadline
+    /// `polling.jobTimeout` passed with the job still running. The job may
+    /// still finish, so the conversion was kept to resume (`isResumable`).
+    case jobTimedOut(jobID: String)
 
     // Catch-all after all retries were exhausted; carries the last error.
     case retriesExhausted(attempts: Int, last: String)
@@ -192,9 +197,12 @@ public extension CloudConvertError {
     /// True when a retry — after the suggested delay — might succeed.
     var isRetryable: Bool {
         switch self {
-        case .notConnected, .network, .timedOut, .rateLimited, .serverError,
+        case .notConnected, .network, .rateLimited, .serverError,
              .uploadFormExpired, .downloadFailed, .jobLost, .transferLost:
             return true
+        case .timedOut(let phase):
+            // A kept conversion is resumed; starting it again would convert the file twice.
+            return phase != .waitingForNetwork
         case .uploadRejected(let status, _):
             return status >= 500 || status == 408 || status == 429
         case .unexpectedStatus(let status, _):
@@ -219,6 +227,20 @@ public extension CloudConvertError {
         return false
     }
 
+    /// True when the conversion stopped while its CloudConvert job may still
+    /// finish, or already has, and was kept rather than cleaned up: the
+    /// network stayed away (`.timedOut(phase: .waitingForNetwork)`) or the
+    /// polling deadline passed (`.jobTimedOut`). Don't start the conversion
+    /// again, which would convert and bill the file twice: call
+    /// `ConversionEngine.resumePendingConversions()` once the device is back
+    /// online (`isConnectivityRelated`), or at the next launch.
+    var isResumable: Bool {
+        switch self {
+        case .timedOut(.waitingForNetwork), .jobTimedOut: return true
+        default: return false
+        }
+    }
+
     /// True when the failure was caused by the device being offline. The engine
     /// waits for connectivity instead of counting these against the retry budget.
     var isConnectivityRelated: Bool {
@@ -227,6 +249,8 @@ public extension CloudConvertError {
             return true
         case .network(let code, _):
             return CloudConvertError.connectivityURLErrorCodes.contains(code)
+        case .timedOut(let phase):
+            return phase == .waitingForNetwork
         default:
             return false
         }
@@ -327,6 +351,9 @@ public extension CloudConvertError {
                 return .storage(reason: nsError.localizedDescription)
             }
         }
+        if nsError.domain == NSPOSIXErrorDomain, nsError.code == Int(ENOSPC) {
+            return .insufficientDiskSpace(required: 0, available: 0)
+        }
         return .invalidResponse(reason: nsError.localizedDescription)
     }
 }
@@ -337,8 +364,10 @@ extension CloudConvertError: LocalizedError {
 
     public var errorDescription: String? { userFacingMessage }
 
-    /// A short message safe to show in an alert. Never leaks URLs, tokens or
-    /// raw server payloads.
+    /// A short message safe to show in an alert. Never contains URLs, tokens
+    /// or text from the server: the server's own explanation stays in the
+    /// associated values (`APIErrorPayload`, the task `message`), which
+    /// `String(describing:)` includes, for logs and support.
     public var userFacingMessage: String {
         switch self {
         case .fileNotFound:
@@ -359,6 +388,8 @@ extension CloudConvertError: LocalizedError {
             return "You appear to be offline. Check your connection and try again."
         case .network:
             return "A network error interrupted the conversion. Please try again."
+        case .timedOut(.waitingForNetwork):
+            return "You appear to be offline. The conversion is paused and can continue once you're back online."
         case .timedOut:
             return "The connection timed out. Please try again."
         case .cancelled:
@@ -369,10 +400,7 @@ extension CloudConvertError: LocalizedError {
             return "The conversion service is temporarily unavailable. Please try again later."
         case .notFound:
             return "The conversion could not be found on the server. Please start again."
-        case .validation(let payload):
-            if let detail = payload?.flattenedErrors ?? payload?.message {
-                return "The conversion request was rejected: \(detail)"
-            }
+        case .validation:
             return "The conversion request was rejected. This file type or option is not supported."
         case .rateLimited:
             return "Too many conversions were started at once. Please wait a moment and try again."
@@ -388,7 +416,7 @@ extension CloudConvertError: LocalizedError {
             return "The converted file could not be downloaded. Please try again."
         case .transferLost:
             return "The transfer was interrupted. Please try again."
-        case .jobFailed(_, _, let code, let message):
+        case .jobFailed(_, _, let code, _):
             switch code {
             case .invalidConversionType:
                 return "Converting between these two formats is not supported."
@@ -404,17 +432,15 @@ extension CloudConvertError: LocalizedError {
                 return "The conversion service is temporarily unavailable. Please try again later."
             case .cancelled:
                 return "The conversion was cancelled."
-            case .conversionFailed where message == nil || message?.isEmpty == true
-                                        || message?.lowercased() == "conversion failed":
+            case .conversionFailed:
                 return "This file could not be converted. It may be damaged or in an unsupported format."
             default:
-                if let message, !message.isEmpty { return "Conversion failed: \(message)" }
                 return "The conversion failed. Please try again or use a different file."
             }
         case .jobLost:
             return "The conversion expired on the server. Please start again."
         case .jobTimedOut:
-            return "The conversion took too long and was stopped. Please try again."
+            return "The conversion is taking longer than expected. It is paused and can continue later."
         case .retriesExhausted:
             return "The conversion failed after several attempts. Please try again later."
         }

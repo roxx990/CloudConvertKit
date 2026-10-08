@@ -86,12 +86,19 @@ public final class BackgroundTransferManager: NSObject, FileTransferring, @unche
     // MARK: Registry of managers per identifier (one per app in practice)
 
     private final class Registry: @unchecked Sendable {
-        private let lock = NSLock()
+        /// Recursive: a manager created by `manager(for:orMake:)` registers
+        /// itself from its initialiser while the lock is held.
+        private let lock = NSRecursiveLock()
         private var managers: [String: BackgroundTransferManager] = [:]
 
         subscript(identifier: String) -> BackgroundTransferManager? {
             get { lock.lock(); defer { lock.unlock() }; return managers[identifier] }
             set { lock.lock(); managers[identifier] = newValue; lock.unlock() }
+        }
+
+        func manager(for identifier: String, orMake make: () -> BackgroundTransferManager) -> BackgroundTransferManager {
+            lock.lock(); defer { lock.unlock() }
+            return managers[identifier] ?? make()
         }
     }
 
@@ -102,6 +109,13 @@ public final class BackgroundTransferManager: NSObject, FileTransferring, @unche
     /// this to reuse an existing manager.
     public static func shared(for identifier: String) -> BackgroundTransferManager? {
         registry[identifier]
+    }
+
+    /// The manager for `identifier`, made by `make` if there is none yet.
+    /// Looking up and creating are one step, so engines created at the same
+    /// time never open two sessions with the same identifier.
+    static func shared(for identifier: String, orMake make: () -> BackgroundTransferManager) -> BackgroundTransferManager {
+        registry.manager(for: identifier, orMake: make)
     }
 
     // MARK: Types
@@ -130,10 +144,16 @@ public final class BackgroundTransferManager: NSObject, FileTransferring, @unche
     private let lock = NSLock()
     private var entries: [String: Entry] = [:]
     private var persisted: [String: PersistedTransfer] = [:]
+    /// Transfers `cancel(id:)` was asked to stop. Any other cancellation came
+    /// from the system (iOS cancels background transfers when the user
+    /// force-quits the app): the transfer is lost, the user cancelled nothing.
+    private var cancelRequested: Set<String> = []
     private var backgroundCompletionHandler: (@Sendable () -> Void)?
     private var reattached = false
 
-    private lazy var session: URLSession = {
+    /// Created in `init`, before the manager can be found through
+    /// `shared(for:)`. Internal so tests can swap in a stubbed session.
+    lazy var session: URLSession = {
         let configuration: URLSessionConfiguration
         if usesBackgroundSession {
             configuration = URLSessionConfiguration.background(withIdentifier: identifier)
@@ -174,9 +194,11 @@ public final class BackgroundTransferManager: NSObject, FileTransferring, @unche
         super.init()
         loadRegistry()
         purge()
-        Self.registry[identifier] = self
-        // Creating the session early re-connects to tasks from a previous launch.
+        // Creating the session early re-connects to tasks from a previous
+        // launch. It must exist before another thread can reach the manager:
+        // two threads initialising the lazy property would open two sessions.
         _ = session
+        Self.registry[identifier] = self
         reattachToRunningTasks()
     }
 
@@ -228,7 +250,11 @@ public final class BackgroundTransferManager: NSObject, FileTransferring, @unche
     }
 
     public func cancel(id: String) {
-        let task = locked { entries[id]?.task }
+        let task: URLSessionTask? = locked {
+            guard let task = entries[id]?.task else { return nil }
+            cancelRequested.insert(id)
+            return task
+        }
         task?.cancel()
     }
 
@@ -236,6 +262,7 @@ public final class BackgroundTransferManager: NSObject, FileTransferring, @unche
         locked {
             entries.removeValue(forKey: id)
             persisted.removeValue(forKey: id)
+            cancelRequested.remove(id)
             saveRegistryLocked()
         }
     }
@@ -281,11 +308,12 @@ public final class BackgroundTransferManager: NSObject, FileTransferring, @unche
                 lock.lock()
                 // The calling task may already have been cancelled, in which
                 // case `onCancel` ran first, the URLSession task was cancelled
-                // and the delegate has (or will) finish the entry without us.
+                // and the delegate has (or will) finish the entry without us,
+                // taking the cancel request with it: the cancellation is ours.
                 if let outcome = persisted[id]?.outcome {
+                    let requested = cancelRequested.remove(id) != nil || Task.isCancelled
                     lock.unlock()
-                    let cancelled = outcome.urlErrorCode == URLError.cancelled.rawValue
-                    continuation.resume(throwing: cancelled ? CloudConvertError.cancelled : CloudConvertError.transferLost(id: id))
+                    continuation.resume(with: Self.result(of: outcome, id: id, kind: kind, cancelRequested: requested))
                     return
                 }
                 guard entries[id] === entry else {
@@ -298,7 +326,7 @@ public final class BackgroundTransferManager: NSObject, FileTransferring, @unche
                 task.resume()
             }
         } onCancel: {
-            task.cancel()
+            self.cancel(id: id)
         }
     }
 
@@ -354,7 +382,7 @@ public final class BackgroundTransferManager: NSObject, FileTransferring, @unche
     // MARK: Completion
 
     private func finish(id: String, outcome: TransferOutcome) {
-        let (entry, continuation): (Entry?, CheckedContinuation<TransferOutcome, Error>?) = locked {
+        let (entry, continuation, requested): (Entry?, CheckedContinuation<TransferOutcome, Error>?, Bool) = locked {
             let entry = entries.removeValue(forKey: id)
             // Only transfers that are still registered get their outcome persisted;
             // one that was forgotten (cancelled / aborted) must not be resurrected.
@@ -365,23 +393,27 @@ public final class BackgroundTransferManager: NSObject, FileTransferring, @unche
             }
             let continuation = entry?.continuation
             entry?.continuation = nil
-            return (entry, continuation)
+            return (entry, continuation, cancelRequested.remove(id) != nil)
         }
 
-        if let continuation {
-            if let code = outcome.urlErrorCode {
-                let urlCode = URLError.Code(rawValue: code)
-                if urlCode == .cancelled {
-                    continuation.resume(throwing: CloudConvertError.cancelled)
-                } else {
-                    continuation.resume(throwing: CloudConvertError.wrap(URLError(urlCode), phase: entry?.kind == .download ? .downloading : .uploading))
-                }
-            } else if let description = outcome.errorDescription {
-                continuation.resume(throwing: CloudConvertError.storage(reason: description))
-            } else {
-                continuation.resume(returning: outcome)
-            }
+        if let continuation, let entry {
+            continuation.resume(with: Self.result(of: outcome, id: id, kind: entry.kind, cancelRequested: requested))
         }
+    }
+
+    /// What the waiter of a finished transfer gets. Only a cancellation that
+    /// `cancel(id:)` asked for is `.cancelled`; one the system made (iOS
+    /// cancels background transfers when the user force-quits the app) is
+    /// `.transferLost`, so the transfer is started again and the job kept.
+    static func result(of outcome: TransferOutcome, id: String, kind: TransferKind,
+                       cancelRequested: Bool) -> Result<TransferOutcome, CloudConvertError> {
+        if let code = outcome.urlErrorCode {
+            let urlCode = URLError.Code(rawValue: code)
+            if urlCode == .cancelled { return .failure(cancelRequested ? .cancelled : .transferLost(id: id)) }
+            return .failure(.wrap(URLError(urlCode), phase: kind == .download ? .downloading : .uploading))
+        }
+        if let description = outcome.errorDescription { return .failure(.storage(reason: description)) }
+        return .success(outcome)
     }
 
     // MARK: Registry persistence
@@ -491,7 +523,8 @@ extension BackgroundTransferManager: URLSessionDelegate, URLSessionTaskDelegate,
             try FileManager.default.moveItem(at: location, to: destination)
             locked { entry?.movedFileURL = destination }
         } catch {
-            logger.error("Could not move download \(id) into place: \(error.localizedDescription)")
+            // The description names the file: metadata, which the default logger keeps private.
+            logger.error("Could not move download \(id) into place", metadata: ["error": error.localizedDescription])
         }
     }
 
@@ -521,7 +554,8 @@ extension BackgroundTransferManager: URLSessionDelegate, URLSessionTaskDelegate,
             } else {
                 outcome.errorDescription = nsError.localizedDescription
             }
-            logger.warning("Transfer \(id) (\(kind.rawValue)) failed: \(nsError.localizedDescription)")
+            logger.warning("Transfer \(id) (\(kind.rawValue)) failed: \(nsError.domain) \(nsError.code)",
+                           metadata: ["error": nsError.localizedDescription])
         } else {
             switch kind {
             case .upload:

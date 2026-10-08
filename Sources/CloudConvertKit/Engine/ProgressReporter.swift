@@ -130,8 +130,9 @@ final class ProgressReporter: @unchecked Sendable {
         guard !isFinished else { lock.unlock(); return }
         if progress.totalBytes > 0 { downloadTotals[index] = progress.totalBytes }
         downloadCompleted[index] = progress.completedBytes
-        let total = downloadTotals.values.reduce(0, +)
-        let done = downloadCompleted.values.reduce(0, +)
+        // Totals start from the sizes the server reported.
+        let total = downloadTotals.values.saturatingSum()
+        let done = downloadCompleted.values.saturatingSum()
         let fraction = total > 0 ? Double(done) / Double(total) : 0
         current.stage = .downloading
         current.bytesTransferred = done

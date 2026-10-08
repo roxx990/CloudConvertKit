@@ -15,19 +15,26 @@ struct JobPoller: Sendable {
     let logger: any CloudConvertLogging
 
     /// Returns the job in its terminal state (`finished` or `error`).
+    ///
+    /// `policy.jobTimeout` counts the waits between checks as planned, not
+    /// wall-clock time: a wait that overran because the app was suspended or
+    /// the device asleep counts only as long as it was meant to last. And
+    /// the job is always checked once more when the deadline has passed, so
+    /// a job that finished meanwhile is never given up on.
     func waitForCompletion(jobID: String,
-                           deadline: Date,
                            onUpdate: @Sendable (CCJob) async -> Void) async throws -> CCJob {
-        var interval = policy.initialInterval
+        // The waits must add up to `jobTimeout`, so none is shorter than
+        // `minimumInterval`, and the multiplier never shortens them.
+        let initialInterval = Double.maximum(policy.initialInterval, Self.minimumInterval)
+        let maxInterval = Double.maximum(policy.maxInterval, Self.minimumInterval)
+        let multiplier = Double.maximum(policy.multiplier, 1)
+        var interval = initialInterval
         var consecutiveFailures = 0
+        var waited: TimeInterval = 0
 
         while true {
             try Task.checkCancellation()
-
-            if Date() >= deadline {
-                logger.error("Job \(jobID) exceeded the polling deadline")
-                throw CloudConvertError.jobTimedOut(jobID: jobID)
-            }
+            var rateLimitWait: TimeInterval?
 
             do {
                 let job = try await api.getJob(id: jobID)
@@ -47,16 +54,17 @@ struct JobPoller: Sendable {
                     throw error
                 case .rateLimited(let retryAfter):
                     // Not a failure of the job; just slow down.
-                    let wait = max(retryAfter ?? policy.maxInterval, policy.initialInterval)
-                    logger.notice("Job \(jobID): rate limited while polling; waiting \(Int(wait))s")
-                    try await sleep(wait, deadline: deadline)
-                    continue
+                    let wait = Double.maximum(retryAfter ?? maxInterval, initialInterval)
+                    logger.notice("Job \(jobID): rate limited while polling; waiting \(String(format: "%.0f", wait))s")
+                    rateLimitWait = wait
                 default:
                     if error.isConnectivityRelated {
                         // Falls through to the normal sleep: when the network
                         // path is up but the host is unreachable (captive
                         // portal, proxy down) the wait returns at once, and
-                        // `continue` would poll in a tight loop.
+                        // `continue` would poll in a tight loop. When the
+                        // network stays away the wait throws `.notConnected`,
+                        // and the engine keeps the conversion to resume later.
                         logger.notice("Job \(jobID): offline while polling; waiting for connectivity")
                         try await connectivity.waitUntilConnected(timeout: offlineWaitTimeout)
                     } else {
@@ -71,14 +79,19 @@ struct JobPoller: Sendable {
                 throw CloudConvertError.wrap(error, phase: .processing)
             }
 
-            try await sleep(interval, deadline: deadline)
-            interval = min(policy.maxInterval, interval * policy.multiplier)
+            guard waited < policy.jobTimeout else {
+                logger.error("Job \(jobID) exceeded the polling deadline")
+                throw CloudConvertError.jobTimedOut(jobID: jobID)
+            }
+            let wait = min(rateLimitWait ?? interval, policy.jobTimeout - waited)
+            try await Task.sleep(seconds: wait)
+            waited += wait
+            if rateLimitWait == nil {
+                interval = min(maxInterval, interval * multiplier)
+            }
         }
     }
 
-    private func sleep(_ seconds: TimeInterval, deadline: Date) async throws {
-        let clamped = max(0, min(seconds, deadline.timeIntervalSinceNow))
-        guard clamped > 0 else { return }
-        try await Task.sleep(nanoseconds: UInt64(clamped * 1_000_000_000))
-    }
+    /// The shortest wait between two checks of a job.
+    static let minimumInterval: TimeInterval = 0.01
 }

@@ -20,17 +20,26 @@ public struct HTTPResponse: Sendable {
         headers.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
     }
 
-    /// Parses `Retry-After` (delta-seconds or HTTP-date).
+    /// Parses `Retry-After` (delta-seconds or HTTP-date). The server or a
+    /// proxy controls it, so a value that is not a finite delay (`inf`,
+    /// `nan`) is ignored and the delay is capped at `maxRetryAfter`.
     public var retryAfter: TimeInterval? {
         guard let raw = header("Retry-After")?.trimmingCharacters(in: .whitespaces) else { return nil }
-        if let seconds = TimeInterval(raw) { return max(0, seconds) }
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-        if let date = formatter.date(from: raw) { return max(0, date.timeIntervalSinceNow) }
-        return nil
+        var delay = TimeInterval(raw)
+        if delay == nil {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = TimeZone(secondsFromGMT: 0)
+            formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+            delay = formatter.date(from: raw)?.timeIntervalSinceNow
+        }
+        guard let delay, delay.isFinite else { return nil }
+        return min(max(0, delay), HTTPResponse.maxRetryAfter)
     }
+
+    /// The longest `Retry-After` honoured. A conversion waiting longer than
+    /// this is better off failing with `.rateLimited`.
+    static let maxRetryAfter: TimeInterval = 10 * 60
 
     public var rateLimitRemaining: Int? {
         header("X-RateLimit-Remaining").flatMap { Int($0) }

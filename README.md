@@ -21,7 +21,7 @@ That one call creates the job, uploads the file on a background session, polls u
 - **No third-party dependencies.** Imports only Foundation, Network and os.
 - **No UI.** The core never imports UIKit, SwiftUI or Combine. It talks to the app through `async` calls, an `AsyncStream` of progress values and a single error type. A separate optional product provides an `ObservableObject` adapter for SwiftUI.
 - **Concurrency-clean.** Builds without warnings under `-strict-concurrency=complete`.
-- **Tested.** 39 tests covering orchestration, resume, cancellation, retry arithmetic and decoding, running against in-memory fakes with no network.
+- **Tested.** 123 tests covering orchestration, resume, cancellation, retry arithmetic and decoding, running against in-memory fakes with no network.
 
 ## Requirements
 
@@ -32,7 +32,7 @@ iOS 15+, macOS 12+, Swift 5.9+ (Xcode 15 or newer). Mac Catalyst works unchanged
 **Swift Package Manager**
 
 ```swift
-.package(url: "https://github.com/roxx990/CloudConvertKit.git", from: "1.0.1"),
+.package(url: "https://github.com/roxx990/CloudConvertKit.git", from: "1.1.0"),
 // then, per target:
 .product(name: "CloudConvertKit", package: "CloudConvertKit")
 ```
@@ -55,12 +55,12 @@ Most hand-rolled CloudConvert clients are a hundred lines that work on a fast co
 | Reading the file with `Data(contentsOf:)` and building the multipart body in memory | Jetsam kill on large inputs; every big file "fails" | Streams the body to disk in 1 MiB chunks on a dedicated IO queue, then uploads with `uploadTask(fromFile:)` |
 | Uploading on `URLSession.shared` | Transfer dies the moment the app is backgrounded | A background `URLSession` whose transfers continue while suspended and are re-attached after relaunch |
 | No retries or backoff | One dropped packet, one 5xx or one 429 ends the conversion | Exponential backoff with jitter at the API, upload, download and job levels, honouring `Retry-After` |
-| No reachability handling | Offline means instant failure with a confusing message | Requests are not attempted while offline; in-flight work waits for the network and reports `.waitingForNetwork` |
+| No reachability handling | Offline means instant failure with a confusing message | Requests are not attempted while offline; in-flight work waits for the network and reports `.waitingForNetwork`; a conversion whose job exists is kept, not lost, if the network stays away |
 | Never checking the upload response status | A rejection from storage is treated as success, then polling never ends | Every transfer outcome is validated; a rejection rebuilds the job with a fresh form |
-| Polling on a fixed interval with no deadline | A stuck job polls until the process dies | Growing interval, hard deadline, bounded failure budget |
+| Polling on a fixed interval with no deadline | A stuck job polls until the process dies | Growing interval, a deadline that ignores time spent suspended, one last check before giving up, bounded failure budget |
 | Downloading only `files.first` | Multi-file outputs such as PDF to JPG silently lose pages | Every exported file is downloaded, or one zip via `archive_multiple_files` |
 | `NSError` with a string domain | No way to tell retryable from fatal, nothing safe to show the user | One error type carrying `isRetryable`, `isCancellation`, `userFacingMessage` and `analyticsCode` |
-| Never deleting the job | Inputs and outputs sit on CloudConvert for 24 hours | The job is deleted as soon as the outputs are saved, and on failure or cancellation |
+| Never deleting the job | Inputs and outputs sit on CloudConvert for 24 hours | The job is deleted as soon as the outputs are saved, and on failure or cancellation; never while it may still finish |
 | No cancellation path | Orphaned temporary files and jobs still consuming credits | Structured cancellation cleans up locally and remotely |
 | Using document-picker URLs directly | Intermittent "file not readable" once the picker's scope ends | Inputs are copied into the package's own directory through `NSFileCoordinator` |
 | Shipping the API key in the app | Key extraction and quota abuse | Authentication is a protocol; the proxy environment keeps the key server-side |
@@ -221,7 +221,9 @@ struct ProcessingView: View {
 }
 ```
 
-Apps using `@Observable` or their own architecture can use `ConversionQueue` and `ConversionHandle` directly. The view model is about 150 lines of reference code, not a requirement.
+`retry(id:)` resumes an item whose error `isResumable` (see [Interrupted conversions](#interrupted-conversions)) instead of converting the file again. If the app already resumed it with `resumePendingConversions()`, the item follows that run, or shows its result. `remove(id:)` and `clearFinished()` discard it; `cancel(id:)` and `remove(id:)` stop it while it runs.
+
+Apps using `@Observable` or their own architecture can use `ConversionQueue` and `ConversionHandle` directly. The view model is about 200 lines of reference code, not a requirement.
 
 ### Discovering formats and options
 
@@ -280,6 +282,29 @@ struct UIKitBackgroundActivity: BackgroundActivityProviding {
 
 Then set `configuration.backgroundActivity = UIKitBackgroundActivity()`.
 
+### Interrupted conversions
+
+Once its job exists on CloudConvert, a conversion is never thrown away because the network or the time ran out: the job may still finish, or already has, and is paid for. When the network stays away longer than `offlineWaitTimeout` (90 s by default), or `polling.jobTimeout` passes with the job still running, the conversion stops with an error whose `isResumable` is `true`: `.timedOut(phase: .waitingForNetwork)` (also `isConnectivityRelated`) or `.jobTimedOut`. Its last stage is `.failed`; its record, staged input and job are kept, and it is listed by `pendingConversions()`.
+
+Don't start it again, which would create a second job and bill the file twice. Resume it, for example once the device is back online:
+
+```swift
+do {
+    show(try await handle.result)
+} catch let error as CloudConvertError where error.isResumable {
+    for await online in ConnectivityMonitor.shared.changes() where online {
+        if let resumed = await engine.resumePendingConversions(where: { $0.id == handle.id }).first {
+            show(try await resumed.result)
+        }
+        break
+    }
+}
+```
+
+`resumePendingConversions(where:)` resumes only the records it accepts (by `id`, or by `userInfo` for conversions your own layer started) and leaves every other record untouched. Otherwise `resumePendingConversions()` at the next launch picks it up, and `discardPendingConversion(id:)` gives it up and deletes the job.
+
+A record already running is never resumed twice, so a second caller gets no handle for it. `resumedConversion(id:)` gives that caller another handle on the run, and on its result once it has ended; it returns `nil` for one that failed for good or was cancelled, which starts over.
+
 ### macOS
 
 Everything builds and the whole test suite runs natively. There is no `handleEventsForBackgroundURLSession` to wire, so skip that step; `usesBackgroundTransfers = false` is fine. Sandboxed apps get security-scoped `NSOpenPanel` URLs, which staging already handles. If your app can be App-Napped mid-conversion, implement `BackgroundActivityProviding` with `ProcessInfo.processInfo.beginActivity(options:reason:)` instead of the UIKit version above.
@@ -288,7 +313,7 @@ Everything builds and the whole test suite runs natively. There is no `handleEve
 
 | Area | Types | Notes |
 |---|---|---|
-| Orchestration | `ConversionEngine` — `convert`, `run`, `start`, `pendingConversions`, `resumePendingConversions`, `discardPendingConversion`, `availableOperations`, `apiClient` | One instance per app |
+| Orchestration | `ConversionEngine` — `convert`, `run`, `start`, `pendingConversions`, `resumePendingConversions`, `resumePendingConversions(where:)`, `resumedConversion(id:)`, `discardPendingConversion`, `availableOperations`, `apiClient` | One instance per app |
 | Handles | `ConversionHandle` — `id`, `progress: AsyncStream`, `result`, `cancel()`, `isCancelled` | Returned by `start` / queue / resume |
 | Batching | `ConversionQueue` — `enqueue(request)`, `enqueue(spec)`, `cancel(id:)`, `cancelAll()` | Actor; bounds concurrency |
 | Requests | `ConversionRequest`, `ProcessingOperation`, `InputFile`, `ExportOptions`, `OutputOptions` | The everyday entry point |
@@ -305,60 +330,70 @@ Progress handlers and `AsyncStream`s deliver values on arbitrary threads; hop to
 
 ## Progress model
 
-`ConversionProgress.fractionCompleted` folds the three network phases with `ProgressWeights` (upload 45 %, processing 35 %, download 20 % by default) and never moves backwards within a job attempt. `stage` tells the UI what is happening, including `.waitingForNetwork` and `.retrying(attempt:delay:scope:reason:)`, so a screen can say "Reconnecting…" instead of freezing. Every conversion ends with exactly one terminal stage: `.completed`, `.failed` or `.cancelled`.
+`ConversionProgress.fractionCompleted` folds the three network phases with `ProgressWeights` (upload 45 %, processing 35 %, download 20 % by default) and never moves backwards within a job attempt. `stage` tells the UI what is happening, including `.waitingForNetwork` and `.retrying(attempt:delay:scope:reason:)`, so a screen can say "Reconnecting…" instead of freezing. Every conversion ends with exactly one terminal stage: `.completed`, `.failed` or `.cancelled`, including one cancelled while still waiting in a `ConversionQueue`. A conversion kept to resume ends with `.failed`; its error tells it apart (`isResumable`).
 
 ## Error model
 
 Every failure is a `CloudConvertError`:
 
-- `userFacingMessage` — safe alert text, never contains URLs or server payloads
+- `userFacingMessage` — safe alert text, never contains URLs or text from the server (that stays in the error's associated values, for logs)
 - `isRetryable` — whether offering a "Try again" button makes sense
 - `isCancellation` — show nothing, or a neutral "Cancelled" state
 - `isConnectivityRelated` — show an offline banner rather than an error alert
+- `isResumable` — the conversion was kept: resume it, don't start it again (see [Interrupted conversions](#interrupted-conversions))
 - `analyticsCode` — stable string for analytics dashboards (`http_429`, `job_failed_invalid_conversion_type`, `upload_rejected_403`, …)
+
+Log messages carry ids, phases and codes. File names, CloudConvert's task messages and response bodies go in the `metadata` of `CloudConvertLogging`, which the default `OSLogCloudConvertLogger` records as private.
 
 ## Edge-case matrix
 
 | Situation | Behaviour |
 |---|---|
 | Device offline when a conversion starts | Not attempted; `stage == .waitingForNetwork` until the network returns or `offlineWaitTimeout` (90 s) elapses → `.notConnected`. The job is not rebuilt: it already waited the full timeout |
-| Connection lost during upload or download | The background session waits for connectivity; if the task errors, the phase retries (upload 3×, download 4×) after waiting for the network. Offline waits do not consume retry attempts. The UI sees `.retrying(scope: .phase(…))` |
-| Connection lost while polling | Polling pauses, resumes when back online, and does not count toward the failure budget |
+| Connection lost during upload or download | The background session waits for connectivity; if the task errors, the phase retries (upload 3×, download 4×) after waiting for the network. Offline waits do not consume retry attempts. The UI sees `.retrying(scope: .phase(…))`. If the network stays away longer than `offlineWaitTimeout`, the conversion is kept: see the next row |
+| Connection lost while polling | Polling pauses and continues when the network returns, without counting toward the failure budget. Offline for longer than `offlineWaitTimeout`, the conversion stops with `.timedOut(phase: .waitingForNetwork)` (`isResumable`): nothing is deleted, and `resumePendingConversions()` continues it. The same applies when resuming at launch while offline |
+| Requests time out while the device is online | Retried like any transient failure; an upload that keeps timing out rebuilds the job with a fresh form. Not kept as if offline |
 | App backgrounded during a large upload | The upload continues in the background session |
-| App backgrounded while polling | `BackgroundActivityProviding`, if wired, buys about 30 seconds; otherwise polling resumes when the app returns |
-| App killed mid-upload | On relaunch, `resumePendingConversions()` re-attaches to the running transfer or picks up its persisted outcome; if the transfer is gone the upload restarts against the same job when the form is still valid, otherwise the job is rebuilt |
+| App backgrounded while polling | `BackgroundActivityProviding`, if wired, buys about 30 seconds; otherwise polling resumes when the app returns. Time spent suspended (or the Mac asleep) does not count toward `polling.jobTimeout`. Intervals shorter than 10 ms count as 10 ms, and a `multiplier` below 1 as 1, so the waits always reach the deadline |
+| App killed mid-upload | On relaunch, `resumePendingConversions()` re-attaches to the running transfer or picks up its persisted outcome; if the transfer is gone the upload restarts against the same job when the form is still valid, otherwise the job is rebuilt. A re-attached upload that failed (5xx, network error) is retried exactly like a fresh one. Since it may have delivered the file and lost only the response, the server is asked first, before sending the file again or rebuilding the job for a form the device clock says has expired |
 | App killed while the server is converting | On relaunch the job is re-fetched by id and polling continues; nothing is re-uploaded |
-| App killed during download | The download is re-attached or restarted; already-saved files are not fetched again |
-| `resumePendingConversions()` called twice, or while conversions run | Running conversions are never reported as pending or started twice |
+| App killed during download | The download is re-attached or restarted; a re-attached download that failed is retried like a fresh one; already-saved files are not fetched again |
+| User force-quits the app during a transfer | iOS cancels the background transfer. That is a lost transfer, restarted at relaunch, not a user cancellation |
+| `resumePendingConversions()` called twice, or while conversions run | Running conversions are never reported as pending or started twice. Each record is read again once claimed, so one that finished meanwhile is not run again. `resumedConversion(id:)` follows a resume already running |
+| `resumePendingConversions(where:)` | Only the records it accepts are resumed; the others stay pending, untouched |
 | Records older than 20 h | Not resumed, since the server purges jobs at 24 h; cleaned up and reported as `.jobLost` |
-| 429 rate limit | `Retry-After` honoured, falling back to backoff; the queue limits concurrent job creation |
+| 429 rate limit | `Retry-After` honoured (up to 10 minutes), falling back to backoff; the queue limits concurrent job creation |
 | 5xx, malformed JSON, or HTML from a CDN | Retried with exponential backoff and jitter (5 attempts for API calls) |
 | 401 | One transparent credential refresh via `AuthorizationProvider.handleUnauthorized()`, then fails without further retries |
 | 402 (credits), 403, 422 | Not retried; specific error cases with safe user text |
-| Upload form expired, or storage returned 4xx | The whole job is rebuilt with a fresh form, once by default |
+| Upload form expired, or storage returned 4xx | The whole job is rebuilt with a fresh form, once by default. The device clock may be wrong, so it only judges forms a previous launch received, and only while a rebuild is still allowed |
 | Storage returned 5xx on upload | The same request is retried against the same form |
 | Task error `TIMEOUT`, `INPUT_TASK_FAILED`, or an unknown code | Job rebuilt once |
 | Task error `INVALID_CONVERSION_TYPE`, `CONVERSION_FAILED`, `OPEN_FAILED`, `SANDBOX_FILE_NOT_ALLOWED`, `FILE_TOO_LARGE` | Not retried, since it would only burn credits; the user gets a specific message |
 | Job disappears (404) | `.jobLost`, rebuilt once |
-| Job stuck in `processing` past `polling.jobTimeout` | `.jobTimedOut`, not retried |
+| Job stuck in `processing` past `polling.jobTimeout` | Checked once more; if still running, `.jobTimedOut` (`isResumable`): the job and the record are kept for `resumePendingConversions()` |
 | Finished job with no exported files | `.exportMissing`, not retried |
-| Multiple exported files | All downloaded, or one zip via `ExportOptions.archiveMultipleFiles` |
+| Multiple exported files | All downloaded, or one zip via `ExportOptions.archiveMultipleFiles`. If the conversion fails, the files it had already saved are removed |
 | Export URL expired (403/404/410 on download) | Treated as `.jobLost`, so the job is rebuilt once |
-| Downloaded file is empty | Retried as a download failure |
+| Downloaded file is empty | Retried as a download failure, unless the server reported the output as 0 bytes |
 | Input missing, unreadable, empty, or over the size limit | Fails locally before any network call |
 | Input larger than the form's `max_file_size` | Fails before uploading |
-| Not enough disk space for the output | Fails before uploading, and again before downloading with the real size |
+| Not enough disk space | `.insufficientDiskSpace` while staging the input; before uploading when there is no room for the largest upload body or the expected outputs; and again before downloading with the real size |
 | Output filename collision | `name (2).ext`, `name (3).ext`, … |
 | Filenames with quotes, slashes or control characters | Sanitised for both the multipart header and the file system |
 | Document-picker or Photos URLs | Security scope handled; the file is copied via `NSFileCoordinator` into the package's staging directory |
 | Large files | The staging copy and the multipart body are written in 1 MiB chunks on a dedicated IO queue, never in memory and never on a Swift-concurrency thread |
-| User cancels, in any phase including the delay before a rebuild | URLSession tasks cancelled, temporary files removed, server job deleted, record removed, exactly one `.cancelled` stage |
+| User cancels, in any phase including the delay before a rebuild, while queued, or while waiting for the network | URLSession tasks cancelled, temporary files removed, server job deleted, record removed, exactly one `.cancelled` stage. A cancellation is never kept to resume, even when the network wait gives up at that moment |
 | Success | The server job is deleted immediately for privacy, temporary files removed, record removed |
 | Crash leaving temporary files behind | Anything older than 48 h is purged at engine init |
 | Unknown future job or task status string | Decoded as `processing` so polling continues instead of crashing |
 | Odd catalogue rows (booleans as 0/1, numbers as strings) | Models decode leniently; one odd row never breaks the list |
+| Absurd values from the server or a proxy (`Retry-After: inf`, `credits: 1e20`, sizes near `Int64.max`) | Capped or treated as unknown; nothing traps |
+| Export URL with a space, non-ASCII characters or a `#` inside the fragment | Decoded the same on every supported OS (invalid characters percent-encoded), never dropped |
 | `percent` reported by the server | Used for the processing phase; otherwise a time-based estimate that never reaches 100 % early |
 | Metered connections | `allowsCellularTransfers = false` restricts transfers to Wi-Fi |
+| On-demand VPN (path `requiresConnection`) | Counts as online, so the request that brings the VPN up is made |
+| Two engines created at once for one background session identifier | They share one transfer manager, so one background session |
 
 ## Proxy contract
 
@@ -377,7 +412,9 @@ Optionally the proxy can enforce per-user quotas, strip `webhook_url`, force a `
 
 Everything lives under `Application Support/<bundle id>/CloudConvertKit/`: `Work/` for staging, multipart bodies, in-flight downloads and records, and `Converted/` for outputs. Application Support is app-private on both platforms, so nothing lands in a user-visible folder on macOS, and the bundle-identifier segment keeps unsandboxed Mac apps apart. Override `outputDirectory` per configuration or `OutputOptions.directory` per request. `Work/` is excluded from backups; `Converted/` is not.
 
-During a conversion the package holds up to two extra copies of the input on disk (the staged copy and the multipart body); the pre-flight free-space check accounts for it.
+During a conversion the package holds up to two extra copies of the input on disk: the staged copy, and the multipart body of the input being uploaded (deleted after its upload). A disk that fills up while staging is reported as `.insufficientDiskSpace`. After staging, the pre-flight check requires room for the larger of the biggest upload body and the expected outputs (`OutputOptions.expectedOutputBytes`, otherwise twice the inputs).
+
+The package ships a privacy manifest (`PrivacyInfo.xcprivacy`) declaring the required-reason APIs it calls: the modification dates of its own temporary files, to purge stale ones, and free disk space, for that check. Nothing is collected or tracked.
 
 ## Design decisions
 
@@ -395,11 +432,11 @@ During a conversion the package holds up to two extra copies of the input on dis
 swift test
 ```
 
-The suite runs entirely against in-memory fakes for the API, the transfer layer and connectivity. It covers the happy path, output naming, multi-file export, deterministic versus transient failure handling, upload rejection leading to a job rebuild, storage 5xx retrying against the same form, offline timeouts, cancellation cleanup both mid-upload and during a rebuild delay, resuming from a persisted record without re-uploading, running conversions being excluded from "pending", queue concurrency, retry and backoff arithmetic, error mapping, and model decoding.
+The suite runs entirely against in-memory fakes for the API, the transfer layer and connectivity. It covers the happy path, output naming, multi-file export, deterministic versus transient failure handling, upload rejection leading to a job rebuild, storage 5xx retrying against the same form, offline timeouts, cancellation cleanup both mid-upload and during a rebuild delay, resuming from a persisted record without re-uploading, running conversions being excluded from "pending", conversions kept when the network or the polling deadline runs out and resumed later, re-attached transfers that failed or were cancelled by the system, a resume followed by a second caller or by the SwiftUI model, queue concurrency, retry and backoff arithmetic, values from the server that must not trap, error mapping, and model decoding.
 
 `Tests/CloudConvertKitTests/Fixtures/` holds real `GET /v2/jobs/{id}` responses (a finished job and a failed one, signed URLs redacted). The regression tests run them through the real `CloudConvertAPI` decoder, and the fakes follow the same shapes: only export tasks list files with a `url`, and an engine that cannot convert a file reports `code: null`.
 
-`StressTests` runs 150 conversions at once against a simulated CloudConvert with seeded faults at every layer, including cancellation at random moments. It then checks that every conversion ends exactly once, that no file is billed twice, that every known job is deleted and that no local state is left. Each run prints its seed; replay one or scale up with:
+`StressTests` runs 150 conversions at once against a simulated CloudConvert with seeded faults at every layer, including cancellation at random moments and networks that drop once the input is uploaded. It resumes the conversions that were kept, once the network is back, then checks that every conversion ends exactly once, that no file is billed twice, that exactly the conversions that may still be billed were kept, that every known job is deleted and that no local state is left. Each run prints its seed; replay one or scale up with:
 
 ```bash
 CCK_STRESS_SEED=1790701569452 CCK_STRESS_COUNT=1000 swift test --filter StressTests

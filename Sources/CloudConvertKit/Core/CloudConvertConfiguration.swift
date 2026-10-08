@@ -39,12 +39,18 @@ public enum CloudConvertEnvironment: Equatable, Sendable {
 /// How long to keep polling a job and how aggressively.
 public struct PollingPolicy: Equatable, Sendable {
     /// Delay before the first status check after the upload completes.
+    /// Intervals shorter than 10 ms count as 10 ms.
     public var initialInterval: TimeInterval
     /// Upper bound for the (growing) interval between checks.
     public var maxInterval: TimeInterval
     /// Growth factor applied after every check that is still `processing`.
+    /// One below 1 counts as 1: the interval never shrinks.
     public var multiplier: Double
-    /// Hard deadline for the whole job (upload complete → finished).
+    /// How long to wait for the job once its inputs are uploaded. Only the
+    /// waits between checks count, never time the app spent suspended or the
+    /// device asleep. When it runs out the job is checked once more, and a
+    /// job still running is kept: the conversion throws `.jobTimedOut`,
+    /// which `isResumable`.
     public var jobTimeout: TimeInterval
     /// Consecutive transient poll failures tolerated before giving up. Each
     /// "failure" is itself a `GET /jobs/{id}` that already exhausted
@@ -102,8 +108,10 @@ public struct CloudConvertConfiguration: Sendable {
     /// scratch (new job, new upload) when the failure is classified retryable.
     public var jobRetryPolicy: RetryPolicy
     public var polling: PollingPolicy
-    /// How long the engine waits for connectivity to return before failing with
-    /// `.notConnected`. Progress reports `.waitingForNetwork` in the meantime.
+    /// How long the engine waits for connectivity to return before giving up:
+    /// with `.notConnected` before the job exists, and after that with
+    /// `.timedOut(phase: .waitingForNetwork)`, which `isResumable`. Progress
+    /// reports `.waitingForNetwork` meanwhile.
     public var offlineWaitTimeout: TimeInterval
     /// Timeout for a single API request (not transfers).
     public var apiRequestTimeout: TimeInterval

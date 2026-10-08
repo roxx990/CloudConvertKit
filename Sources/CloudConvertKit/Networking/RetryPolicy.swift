@@ -81,7 +81,7 @@ func retrying<T>(policy: RetryPolicy,
                 try await waitForNetwork()
                 // The wait returns at once when the path is up but the host is
                 // unreachable; back off instead of re-sending immediately.
-                try await Task.sleep(nanoseconds: UInt64(policy.delay(forAttempt: offlineWaits) * 1_000_000_000))
+                try await Task.sleep(seconds: policy.delay(forAttempt: offlineWaits))
                 continue
             }
 
@@ -95,7 +95,16 @@ func retrying<T>(policy: RetryPolicy,
             logger.warning("\(label): attempt \(attempt) failed (\(ccError.analyticsCode)); retrying in \(String(format: "%.1f", delay))s",
                            metadata: ["phase": phase.rawValue])
             await onRetry?(attempt, delay, ccError)
-            try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            try await Task.sleep(seconds: delay)
         }
+    }
+}
+
+extension Task where Success == Never, Failure == Never {
+    /// `Task.sleep(nanoseconds:)` for any delay, including one that came from
+    /// a server: a negative or NaN delay does not sleep, and a huge or
+    /// infinite one is capped instead of trapping in `UInt64(_:)`.
+    static func sleep(seconds: TimeInterval) async throws {
+        try await sleep(nanoseconds: seconds > 0 ? UInt64(min(seconds, 1e9) * 1e9) : 0)
     }
 }

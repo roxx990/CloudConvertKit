@@ -85,10 +85,12 @@ public extension JSONValue {
         return nil
     }
 
+    /// `nil` for a number that is not a whole `Int`, including one out of
+    /// range such as `1e20` or infinity.
     var intValue: Int? {
         switch self {
         case .int(let value): return value
-        case .double(let value) where value.rounded() == value: return Int(value)
+        case .double(let value): return Int(exactly: value)
         case .string(let value): return Int(value)
         default: return nil
         }

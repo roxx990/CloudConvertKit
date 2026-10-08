@@ -29,22 +29,38 @@ public actor ConnectivityMonitor: ConnectivityMonitoring {
     private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var subscribers: [UUID: AsyncStream<Bool>.Continuation] = [:]
     private var started = false
+    /// Number of the newest path reading applied.
+    private var lastReading = 0
 
     public init() {}
 
     private func startIfNeeded() {
         guard !started else { return }
         started = true
+        let readings = ReadingCounter()
         monitor.pathUpdateHandler = { [weak self] path in
-            let isSatisfied = path.status == .satisfied
+            // The monitor reports one path at a time, but each hops onto the
+            // actor in its own task, so they can arrive out of order. The
+            // number lets `update` drop a stale one instead of applying it.
+            let reading = readings.next()
+            let isUsable = ConnectivityMonitor.isUsable(path.status)
             let isExpensive = path.isExpensive
             guard let self else { return }
-            Task { await self.update(connected: isSatisfied, expensive: isExpensive) }
+            Task { await self.update(reading, connected: isUsable, expensive: isExpensive) }
         }
         monitor.start(queue: queue)
     }
 
-    private func update(connected newValue: Bool, expensive newExpensive: Bool) {
+    /// Only `.unsatisfied` is offline. `.requiresConnection` (an on-demand
+    /// VPN, a cellular link that wakes up on use) comes up when a request is
+    /// made, so refusing to make one would keep it down.
+    static func isUsable(_ status: NWPath.Status) -> Bool {
+        status != .unsatisfied
+    }
+
+    func update(_ reading: Int, connected newValue: Bool, expensive newExpensive: Bool) {
+        guard reading > lastReading else { return }
+        lastReading = reading
         let previous = connected
         connected = newValue
         expensive = newExpensive
@@ -76,7 +92,7 @@ public actor ConnectivityMonitor: ConnectivityMonitoring {
 
         let id = UUID()
         let timeoutTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
+            try? await Task.sleep(seconds: timeout)
             guard !Task.isCancelled else { return }
             await self?.resumeWaiter(id: id)
         }
@@ -118,5 +134,17 @@ public actor ConnectivityMonitor: ConnectivityMonitoring {
 
     private func unsubscribe(id: UUID) {
         subscribers.removeValue(forKey: id)
+    }
+}
+
+/// Numbers path readings in the order `NWPathMonitor` reports them.
+private final class ReadingCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    func next() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        value += 1
+        return value
     }
 }
