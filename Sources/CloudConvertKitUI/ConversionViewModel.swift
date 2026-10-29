@@ -44,11 +44,11 @@ public final class ConversionViewModel: ObservableObject {
 
         public var statusText: String {
             switch state {
-            case .queued: return "Waiting…"
-            case .running: return progress?.localizedStageDescription ?? "Starting…"
-            case .succeeded: return "Done"
-            case .failed: return error?.userFacingMessage ?? "Failed"
-            case .cancelled: return "Cancelled"
+            case .queued: return CloudConvertLocalization.string("cloudconvert.item.queued", "Waiting…")
+            case .running: return progress?.localizedStageDescription ?? CloudConvertLocalization.string("cloudconvert.stage.creatingJob", "Starting…")
+            case .succeeded: return CloudConvertLocalization.string("cloudconvert.stage.completed", "Done")
+            case .failed: return error?.userFacingMessage ?? CloudConvertLocalization.string("cloudconvert.stage.failed", "Failed")
+            case .cancelled: return CloudConvertLocalization.string("cloudconvert.stage.cancelled", "Cancelled")
             }
         }
 
@@ -63,10 +63,26 @@ public final class ConversionViewModel: ObservableObject {
     private let queue: ConversionQueue
     private var handles: [String: ConversionHandle] = [:]
     private var observers: [String: Task<Void, Never>] = [:]
+    /// Follows `automaticResumes()`; ended with the model.
+    private let resumeFollower = TaskHolder()
 
     public init(engine: ConversionEngine, maxConcurrent: Int? = nil) {
         self.engine = engine
         self.queue = ConversionQueue(engine: engine, maxConcurrent: maxConcurrent)
+        // An item paused offline that the engine continues when the network
+        // comes back (`resumesWhenOnline`) follows that run.
+        guard engine.configuration.resumesWhenOnline else { return }
+        let resumes = engine.automaticResumes()
+        resumeFollower.task = Task { [weak self] in
+            for await handle in resumes {
+                guard let self else { return }
+                self.adopt(handle)
+            }
+        }
+    }
+
+    deinit {
+        resumeFollower.task?.cancel()
     }
 
     // MARK: Derived state
@@ -141,6 +157,17 @@ public final class ConversionViewModel: ObservableObject {
 
     // MARK: Internals
 
+    private func adopt(_ handle: ConversionHandle) {
+        guard let item = items.first(where: { $0.id == handle.id }), item.state.isFinished,
+              item.error?.isResumable == true else { return }
+        forget(handle.id)
+        update(handle.id) {
+            $0.state = .running
+            $0.error = nil
+        }
+        observe(handle)
+    }
+
     private func enqueue(_ request: ConversionRequest) async {
         let handle = await queue.enqueue(request)
         items.append(Item(id: handle.id, request: request, state: .queued))
@@ -211,5 +238,16 @@ public final class ConversionViewModel: ObservableObject {
         var item = items[index]
         body(&item)
         items[index] = item
+    }
+}
+
+/// A task a main-actor model starts and its `deinit` ends.
+private final class TaskHolder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Task<Void, Never>?
+
+    var task: Task<Void, Never>? {
+        get { lock.lock(); defer { lock.unlock() }; return value }
+        set { lock.lock(); value = newValue; lock.unlock() }
     }
 }

@@ -44,6 +44,34 @@ public enum ProcessingOperation: Equatable, Sendable, Codable {
         default: return false
         }
     }
+
+    /// The operation's name on the wire (`convert`, `merge`, `optimize`…).
+    public var wireName: String {
+        switch self {
+        case .convert: return CCOperationName.convert.rawValue
+        case .merge: return CCOperationName.merge.rawValue
+        case .archive: return CCOperationName.archive.rawValue
+        case .optimize: return CCOperationName.optimize.rawValue
+        case .thumbnail: return CCOperationName.thumbnail.rawValue
+        case .watermark: return CCOperationName.watermark.rawValue
+        case .custom(let name, _): return name
+        }
+    }
+}
+
+/// One more operation applied to what the step before it produced, in the
+/// same job: `.convert(outputFormat: "pdf")` then `.optimize()`, or each
+/// file converted and then `.archive()` into one ZIP. Nothing is
+/// downloaded in between.
+public struct ProcessingStep: Equatable, Sendable, Codable {
+    public var operation: ProcessingOperation
+    /// Engine options for this step's task(s) only.
+    public var options: [String: JSONValue]
+
+    public init(_ operation: ProcessingOperation, options: [String: JSONValue] = [:]) {
+        self.operation = operation
+        self.options = options
+    }
 }
 
 public struct ExportOptions: Equatable, Sendable, Codable {
@@ -83,6 +111,11 @@ public struct ConversionRequest: Equatable, Sendable, Codable {
 
     public var inputs: [InputFile]
     public var operation: ProcessingOperation
+    /// Operations applied, in order, to what `operation` produced, in the
+    /// same job. `options`, `engine` and `engineVersion` belong to
+    /// `operation`; each step carries its own. `outputFilename` names what
+    /// the last step produces.
+    public var followUps: [ProcessingStep]
     /// Engine options forwarded verbatim to each processing task
     /// (`audio_bitrate`, `quality`, `pages`, `video_codec`, …).
     public var options: [String: JSONValue]
@@ -98,9 +131,17 @@ public struct ConversionRequest: Equatable, Sendable, Codable {
     public var tag: String?
     /// Free-form client data echoed back on the result (e.g. a history row id).
     public var userInfo: [String: String]
+    /// Makes the request idempotent: with a key, `convert` continues the
+    /// conversion kept for it (by a resumable error, or a previous launch)
+    /// instead of converting, and billing, the file again, and starts over
+    /// only when that one can no longer finish. Use the app's id for the
+    /// item (a history row, a list entry). At most one conversion per key
+    /// runs at a time.
+    public var key: String?
 
     public init(inputs: [InputFile],
                 operation: ProcessingOperation,
+                followUps: [ProcessingStep] = [],
                 options: [String: JSONValue] = [:],
                 outputFilename: String? = nil,
                 engine: String? = nil,
@@ -109,9 +150,12 @@ public struct ConversionRequest: Equatable, Sendable, Codable {
                 export: ExportOptions = .default,
                 output: OutputOptions = .default,
                 tag: String? = nil,
-                userInfo: [String: String] = [:]) {
+                userInfo: [String: String] = [:],
+                key: String? = nil) {
         self.inputs = inputs
         self.operation = operation
+        self.followUps = followUps
+        self.key = key
         self.options = options
         self.outputFilename = outputFilename
         self.engine = engine
@@ -152,72 +196,81 @@ public struct ConversionRequest: Equatable, Sendable, Codable {
 
     // MARK: Job specification
 
+    /// `operation` and then `followUps`, as steps.
+    public var processingSteps: [ProcessingStep] {
+        [ProcessingStep(operation)] + followUps
+    }
+
     public func makeJobSpecification(defaultTag: String?, defaultTimeout: Int?) throws -> JobSpecification {
         guard !inputs.isEmpty else {
             throw CloudConvertError.invalidRequest(reason: "No input files were provided.")
         }
-        if operation.combinesInputs == false, inputs.count > 1, outputFilename != nil {
+        let producesOneFile = inputs.count == 1 || processingSteps.contains { $0.operation.combinesInputs }
+        if outputFilename != nil, !producesOneFile {
             throw CloudConvertError.invalidRequest(reason: "outputFilename can only be used with a single input or a combining operation.")
         }
 
         var builder = JobBuilder(tag: tag ?? defaultTag, defaultTimeout: timeout ?? defaultTimeout)
 
-        var imports: [TaskRef] = []
+        var current: [TaskRef] = []
+        // The format of what each current task produces, when known.
+        var formats: [String?] = []
         for (index, input) in inputs.enumerated() {
-            imports.append(builder.importUpload(input, name: "import-\(index + 1)"))
+            current.append(builder.importUpload(input, name: "import-\(index + 1)"))
+            formats.append(input.effectiveInputFormat)
         }
 
-        var processing: [TaskRef] = []
-        if operation.combinesInputs {
-            processing.append(builder.addTask(name: "process-1",
-                                              operation: operationName,
-                                              inputs: imports,
-                                              options: taskOptions(for: nil)))
-        } else {
-            for (index, importRef) in imports.enumerated() {
-                processing.append(builder.addTask(name: "process-\(index + 1)",
-                                                  operation: operationName,
-                                                  inputs: [importRef],
-                                                  options: taskOptions(for: inputs[index])))
+        let steps = processingSteps
+        for (stepIndex, step) in steps.enumerated() {
+            let isFirst = stepIndex == 0
+            let isLast = stepIndex == steps.count - 1
+            // The first step keeps the 1.x task names (`process-1`…).
+            let prefix = isFirst ? "process" : "step\(stepIndex + 1)"
+            if step.operation.combinesInputs {
+                let options = taskOptions(step, isFirst: isFirst, isLast: isLast, inputFormat: nil)
+                current = [builder.addTask(name: "\(prefix)-1", operation: step.operation.wireName, inputs: current, options: options)]
+                formats = [step.operation.outputFormat]
+            } else {
+                var next: [TaskRef] = []
+                var nextFormats: [String?] = []
+                for (index, ref) in current.enumerated() {
+                    let options = taskOptions(step, isFirst: isFirst, isLast: isLast, inputFormat: formats[index])
+                    next.append(builder.addTask(name: "\(prefix)-\(index + 1)", operation: step.operation.wireName,
+                                                inputs: [ref], options: options))
+                    nextFormats.append(step.operation.outputFormat ?? formats[index])
+                }
+                current = next
+                formats = nextFormats
             }
         }
 
-        builder.exportURL(processing,
+        builder.exportURL(current,
                           inline: export.inline,
                           archiveMultipleFiles: export.archiveMultipleFiles,
                           name: "export-1")
         return try builder.build()
     }
 
-    private var operationName: String {
-        switch operation {
-        case .convert: return CCOperationName.convert.rawValue
-        case .merge: return CCOperationName.merge.rawValue
-        case .archive: return CCOperationName.archive.rawValue
-        case .optimize: return CCOperationName.optimize.rawValue
-        case .thumbnail: return CCOperationName.thumbnail.rawValue
-        case .watermark: return CCOperationName.watermark.rawValue
-        case .custom(let name, _): return name
-        }
-    }
-
-    private func taskOptions(for input: InputFile?) -> [String: JSONValue] {
-        var merged = options
-        if let format = operation.outputFormat { merged["output_format"] = .string(format) }
-        if let input, let inputFormat = input.effectiveInputFormat, merged["input_format"] == nil {
+    private func taskOptions(_ step: ProcessingStep, isFirst: Bool, isLast: Bool, inputFormat: String?) -> [String: JSONValue] {
+        var merged = isFirst ? options.merging(step.options) { _, own in own } : step.options
+        if let format = step.operation.outputFormat { merged["output_format"] = .string(format) }
+        // A combining task takes files of several formats: no single input format.
+        if let inputFormat, merged["input_format"] == nil, !step.operation.combinesInputs {
             merged["input_format"] = .string(inputFormat)
         }
-        if case .optimize(let profile) = operation, let profile, merged["profile"] == nil {
+        if case .optimize(let profile) = step.operation, let profile, merged["profile"] == nil {
             merged["profile"] = .string(profile)
         }
-        if case .thumbnail(_, let width, let height, let fit) = operation {
+        if case .thumbnail(_, let width, let height, let fit) = step.operation {
             if let width, merged["width"] == nil { merged["width"] = .int(width) }
             if let height, merged["height"] == nil { merged["height"] = .int(height) }
             if let fit, merged["fit"] == nil { merged["fit"] = .string(fit) }
         }
-        if let outputFilename, merged["filename"] == nil { merged["filename"] = .string(outputFilename) }
-        if let engine, merged["engine"] == nil { merged["engine"] = .string(engine) }
-        if let engineVersion, merged["engine_version"] == nil { merged["engine_version"] = .string(engineVersion) }
+        if isLast, let outputFilename, merged["filename"] == nil { merged["filename"] = .string(outputFilename) }
+        if isFirst {
+            if let engine, merged["engine"] == nil { merged["engine"] = .string(engine) }
+            if let engineVersion, merged["engine_version"] == nil { merged["engine_version"] = .string(engineVersion) }
+        }
         return merged
     }
 }

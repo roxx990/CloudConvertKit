@@ -84,21 +84,22 @@ public struct ConversionProgress: Equatable, Sendable {
         self.jobID = jobID
     }
 
-    /// Short, user-presentable description of the current stage. Apps that
-    /// localise should switch on `stage` themselves; this is English only.
+    /// Short, user-presentable description of the current stage, through
+    /// `CloudConvertLocalization`.
     public var localizedStageDescription: String {
         switch stage {
-        case .preparing: return "Preparing…"
-        case .waitingForNetwork: return "Waiting for network…"
-        case .creatingJob: return "Starting…"
-        case .uploading: return "Uploading…"
-        case .processing: return "Converting…"
-        case .downloading: return "Downloading…"
-        case .finishing: return "Finishing…"
-        case .retrying(let attempt, _, _, _): return "Retrying (\(attempt))…"
-        case .completed: return "Done"
-        case .failed: return "Failed"
-        case .cancelled: return "Cancelled"
+        case .preparing: return CloudConvertLocalization.string("cloudconvert.stage.preparing", "Preparing…")
+        case .waitingForNetwork: return CloudConvertLocalization.string("cloudconvert.stage.waitingForNetwork", "Waiting for network…")
+        case .creatingJob: return CloudConvertLocalization.string("cloudconvert.stage.creatingJob", "Starting…")
+        case .uploading: return CloudConvertLocalization.string("cloudconvert.stage.uploading", "Uploading…")
+        case .processing: return CloudConvertLocalization.string("cloudconvert.stage.processing", "Converting…")
+        case .downloading: return CloudConvertLocalization.string("cloudconvert.stage.downloading", "Downloading…")
+        case .finishing: return CloudConvertLocalization.string("cloudconvert.stage.finishing", "Finishing…")
+        case .retrying(let attempt, _, _, _):
+            return CloudConvertLocalization.format("cloudconvert.stage.retrying", "Retrying (%d)…", attempt)
+        case .completed: return CloudConvertLocalization.string("cloudconvert.stage.completed", "Done")
+        case .failed: return CloudConvertLocalization.string("cloudconvert.stage.failed", "Failed")
+        case .cancelled: return CloudConvertLocalization.string("cloudconvert.stage.cancelled", "Cancelled")
         }
     }
 }

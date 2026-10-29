@@ -87,18 +87,24 @@ public enum MultipartFormWriter {
         }
         defer { try? input.close() }
 
-        while true {
+        var more = true
+        while more {
             try Task.checkCancellation()
             if isCancelled() { throw CloudConvertError.cancelled }
-            let chunk: Data?
-            do {
-                chunk = try input.read(upToCount: chunkSize)
-            } catch {
-                throw CloudConvertError.fileNotReadable(file, underlying: error.localizedDescription)
+            // Each chunk is left for a pool to free, and the thread's pool may
+            // not drain until the whole file is copied: a large upload would
+            // otherwise sit in memory whole.
+            try autoreleasepool {
+                let chunk: Data?
+                do {
+                    chunk = try input.read(upToCount: chunkSize)
+                } catch {
+                    throw CloudConvertError.fileNotReadable(file, underlying: error.localizedDescription)
+                }
+                guard let chunk, !chunk.isEmpty else { more = false; return }
+                try output.write(contentsOf: chunk)
+                total += Int64(chunk.count)
             }
-            guard let chunk, !chunk.isEmpty else { break }
-            try output.write(contentsOf: chunk)
-            total += Int64(chunk.count)
         }
 
         try append("\r\n--\(boundary)--\r\n")

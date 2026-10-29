@@ -2,7 +2,7 @@
 
 A dependency-free Swift package for the [CloudConvert v2 API](https://cloudconvert.com/api/v2). It owns the entire lifecycle of a file conversion, from validating the input to saving the output, and handles the failure modes that break most integrations: lost connections, files too large for memory, rate limits, expired upload forms, multi-file outputs, cancellation, and the app being suspended or killed mid-transfer.
 
-[![Swift 5.9](https://img.shields.io/badge/Swift-5.9%2B-orange.svg)](https://swift.org)
+[![Swift 6](https://img.shields.io/badge/Swift-6.0%2B-orange.svg)](https://swift.org)
 [![Platforms](https://img.shields.io/badge/Platforms-iOS%2015%2B%20%7C%20macOS%2012%2B-blue.svg)](https://developer.apple.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
@@ -20,19 +20,20 @@ That one call creates the job, uploads the file on a background session, polls u
 
 - **No third-party dependencies.** Imports only Foundation, Network and os.
 - **No UI.** The core never imports UIKit, SwiftUI or Combine. It talks to the app through `async` calls, an `AsyncStream` of progress values and a single error type. A separate optional product provides an `ObservableObject` adapter for SwiftUI.
-- **Concurrency-clean.** Builds without warnings under `-strict-concurrency=complete`.
-- **Tested.** 123 tests covering orchestration, resume, cancellation, retry arithmetic and decoding, running against in-memory fakes with no network.
+- **Concurrency-clean.** Builds without warnings under strict concurrency checking, and a test target built in the Swift 6 language mode uses it as an app does.
+- **Localizable.** Every message and stage description goes through one hook with stable keys.
+- **Tested.** 175 tests covering orchestration, resume, cancellation, retry arithmetic and decoding, running against in-memory fakes with no network. The fakes ship as `CloudConvertKitTesting`, for your own tests.
 
 ## Requirements
 
-iOS 15+, macOS 12+, Swift 5.9+ (Xcode 15 or newer). Mac Catalyst works unchanged.
+iOS 15+, macOS 12+, a Swift 6 toolchain (Xcode 16 or newer). Your code may use the Swift 5 or 6 language mode. Mac Catalyst works unchanged.
 
 ## Installation
 
 **Swift Package Manager**
 
 ```swift
-.package(url: "https://github.com/roxx990/CloudConvertKit.git", from: "1.1.0"),
+.package(url: "https://github.com/roxx990/CloudConvertKit.git", from: "2.0.0"),
 // then, per target:
 .product(name: "CloudConvertKit", package: "CloudConvertKit")
 ```
@@ -45,6 +46,7 @@ iOS 15+, macOS 12+, Swift 5.9+ (Xcode 15 or newer). Mac Catalyst works unchanged
 |---|---|---|
 | `CloudConvertKit` | Foundation, Network, os | The pipeline. Everything an app needs. |
 | `CloudConvertKitUI` | CloudConvertKit, Combine | `ConversionViewModel`: an `@MainActor ObservableObject` for a processing screen. Optional. |
+| `CloudConvertKitTesting` | CloudConvertKit | `FakeCloudConvertAPI`, `FakeFileTransfers`, `FakeConnectivity`, `AlwaysOnline`, `AlwaysOffline`: scripted fakes for tests. |
 
 ## What this handles that a direct integration usually does not
 
@@ -64,22 +66,26 @@ Most hand-rolled CloudConvert clients are a hundred lines that work on a fast co
 | No cancellation path | Orphaned temporary files and jobs still consuming credits | Structured cancellation cleans up locally and remotely |
 | Using document-picker URLs directly | Intermittent "file not readable" once the picker's scope ends | Inputs are copied into the package's own directory through `NSFileCoordinator` |
 | Shipping the API key in the app | Key extraction and quota abuse | Authentication is a protocol; the proxy environment keeps the key server-side |
+| Retrying "Convert" after a pause | The file is converted, and billed, twice | `ConversionRequest.key` continues the conversion kept for it instead |
+| Sending an option the engine doesn't take | The job fails after the upload, credits spent | `validatesRequests` checks pair and options against the cached catalogue first |
+| Blaming the file for an empty account | Users are told their file is broken | `CloudConvertError.category` tells input, account, connectivity and service apart; `AccountObserving` tells the developer |
 
 ## Architecture
 
 ```
 Sources/
 ├── CloudConvertKit/
-│   ├── Core/          Configuration, error taxonomy, JSON value, logging, file storage,
-│   │                  blocking-IO helper, background-activity hook
+│   ├── Core/          Configuration, error taxonomy, localization hook, JSON value, logging,
+│   │                  file storage, blocking-IO helper, background activity
 │   ├── Models/        Codable mirrors of jobs / tasks / upload forms / exports / operations / user / pages
 │   ├── JobBuilding/   TaskDefinition, JobSpecification, JobBuilder (fluent), ConversionRequest (high level)
 │   ├── Networking/    Auth provider, retry policy, connectivity, HTTP transport, multipart writer,
 │   │                  background transfer manager
-│   ├── API/           Typed endpoints (jobs, tasks, operations, formats, user)
+│   ├── API/           Typed endpoints (jobs, tasks, operations, formats, user), CloudConvertCatalog
 │   └── Engine/        ConversionEngine (orchestrator), JobPoller, ProgressReporter,
 │                      ConversionRecordStore (crash-safe state), ConversionQueue (concurrency limit)
-└── CloudConvertKitUI/ ConversionViewModel (ObservableObject) — optional
+├── CloudConvertKitUI/ ConversionViewModel (ObservableObject) — optional
+└── CloudConvertKitTesting/ Fakes for the API, transfers and connectivity
 ```
 
 Dependency direction is strictly downwards: UI → Engine → API/Networking → Models/Core. Every seam is a protocol (`CloudConvertAPIClient`, `FileTransferring`, `ConnectivityMonitoring`, `ConversionRecordStoring`, `AuthorizationProvider`, `HTTPTransport`, `CloudConvertLogging`, `BackgroundActivityProviding`), so any layer can be replaced or faked.
@@ -93,14 +99,10 @@ Build one configuration at launch and keep one engine per background session ide
 Fine for development, sandbox work and Mac tools. The key is in the app, so treat it as public.
 
 ```swift
-CloudConvertConfiguration.direct(apiKey: key,
-                                 environment: .sandbox,
-                                 backgroundSessionIdentifier: "com.example.app.cloudconvert")
+CloudConvertConfiguration.direct(apiKey: key, environment: .sandbox)
 ```
 
-Available environments: `.production`, `.europe`, `.unitedStates`, `.sandbox`, and `.proxy(baseURL:)`.
-
-> **Always pass `environment:` explicitly.** If you leave it out, `direct(...)` uses **`.sandbox`**, not `.production`. A production API key sent to the sandbox fails with `401` (`CloudConvertError.unauthorized`). The default will be removed in the next major version.
+Available environments: `.production`, `.europe`, `.unitedStates`, `.sandbox`, and `.proxy(baseURL:)`. `environment` has no default: a production key sent to the sandbox fails with `401`, and the other way round. The background session identifier defaults to `<bundle id>.cloudconvert` and the job tag to `<bundle id> <version> (<platform>)`; pass your own to keep existing ones.
 
 ### Through your own backend (recommended for shipping apps)
 
@@ -126,14 +128,15 @@ enum ConversionServices {
 
 ### Fetching the key at runtime
 
-If the key lives in a remote config store (Firebase Realtime Database, Remote Config, your own endpoint), supply a closure. `RefreshableTokenAuthorization` fetches on first use, caches, sends `Authorization: Bearer <key>`, and on a 401 drops the cache and fetches once more, so rotating the key takes effect without an app update. The package has no dependency on any of those SDKs.
+If the key lives in a remote config store (Firebase Realtime Database, Remote Config, your own endpoint), supply a closure. The whole setup:
 
 ```swift
-CloudConvertConfiguration(
-    environment: .production,
-    authorizationProvider: RefreshableTokenAuthorization { try await RemoteAPIKey.fetch() },
-    backgroundSessionIdentifier: "com.example.app.cloudconvert")
+static let engine = ConversionEngine(configuration: .fetchingKey {
+    try await RemoteAPIKey.fetch()
+})
 ```
+
+`RefreshableTokenAuthorization` fetches on first use and caches. Requests that need the key at the same time share one fetch. On a 401 it drops the key it sent and fetches once more, so rotating the key takes effect without an app update, and several requests refused together fetch once. When the fetch fails (the store is down, or holds no key), the conversion stops with `.authorizationFailed`, which is not retried, and the failure is reported again without fetching for `failureCooldown` seconds (10 by default). The package has no dependency on any of those SDKs.
 
 Persist the last good key in the Keychain inside your fetcher so an outage or a cold start without network does not block a conversion. Note this improves on hardcoding (instant rotation, nothing in the binary) but the key still reaches the device, so it is not a substitute for a proxy.
 
@@ -164,6 +167,23 @@ ConversionRequest.convert([url1, url2], to: "epub")
 
 Attach your own data with `request.userInfo`, and it comes back on the result.
 
+Give a request a `key` (the id of the item in your app) and it becomes idempotent: `convert` continues the conversion kept for that key, after a resumable error or by a previous launch, instead of converting and billing the file again. It starts over only when that conversion can no longer finish (its job expired, its staged copy is gone). At most one conversion per key runs at a time.
+
+```swift
+var request = ConversionRequest.convert(fileURL, to: "pdf")
+request.key = row.id.uuidString       // "Try again" on this row never bills twice
+```
+
+Several operations run in one job with `followUps`, without downloading in between:
+
+```swift
+var request = ConversionRequest.convert(docURL, to: "pdf")
+request.followUps = [ProcessingStep(.optimize(profile: "max"))]      // convert, then compress
+
+var photos = ConversionRequest.convert(imageURLs, to: "jpg")
+photos.followUps = [ProcessingStep(.archive())]                       // one ZIP of them all
+```
+
 ### Observing instead of awaiting
 
 ```swift
@@ -190,7 +210,7 @@ Supported operations: `convert`, `merge`, `archive`, `optimize`, `thumbnail`, `w
 
 ### Batching
 
-`ConversionQueue` bounds concurrency (default 2) so twenty files do not create twenty jobs at once and trip the rate limit.
+The engine runs at most `maxConcurrentConversions` (2 by default) at once, those it resumes included; the rest wait at `.preparing`. So twenty files do not create twenty jobs at once and trip the rate limit. `ConversionQueue` adds handles and ordering on top. `engine.cancel(id:)` and `engine.cancelAll()` stop conversions however they were started.
 
 ```swift
 let queue = ConversionQueue(engine: engine, maxConcurrent: 2)
@@ -227,14 +247,18 @@ Apps using `@Observable` or their own architecture can use `ConversionQueue` and
 
 ### Discovering formats and options
 
-Option names come from the engine behind each conversion and change over time, so the API is the source of truth:
+Option names come from the engine behind each conversion and change over time, so the API is the source of truth. `engine.catalog` keeps `/convert/formats` (with options) on disk for `catalogMaxAge` (a week), and falls back to that copy when the API can't be reached:
 
 ```swift
-let ops = try await engine.availableOperations(
-    OperationsFilter(inputFormat: "heic", outputFormat: "jpg", includeOptions: true))
+try await engine.catalog.supports(ConversionPair("heic", "jpg"))
+try await engine.catalog.outputFormats(from: "docx")
+try await engine.catalog.options(for: ConversionPair("mp4", "webm"))
+try await engine.catalog.issues(in: request)      // unsupported pair, unknown option, bad value
 
-let credits = try await engine.apiClient.currentUser().credits    // needs the user.read scope
+let credits = try await engine.creditBalance()     // needs the user.read scope
 ```
+
+Pairs CloudConvert offers but fails on are left out (`ConversionPair.knownFailures`: DOC and PPT to PDF, which end in `EXPORT_FAILED`); set `knownFailingConversions` to change the list. With `validatesRequests = true`, every request is checked before anything is staged or uploaded and fails with `.invalidRequest` instead of after the upload; a catalogue that can't be loaded checks nothing.
 
 ## App lifecycle
 
@@ -254,33 +278,18 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication,
                      handleEventsForBackgroundURLSession identifier: String,
                      completionHandler: @escaping () -> Void) {
+        BackgroundTransferManager.handleEventsForBackgroundURLSession(identifier: identifier,
+                                                                      completionHandler: completionHandler)
         _ = ConversionServices.engine
-        BackgroundTransferManager.shared(for: identifier)?.setBackgroundCompletionHandler(completionHandler)
     }
 }
 ```
+
+The handler is never dropped: one that arrives before the engine exists waits for it, and one that arrives just after the session delivered its events is called at once. The system's closure is taken as it is, also in the Swift 6 language mode.
 
 `resumePendingConversions()` returns handles for conversions that were in flight when the app last died, so a processing screen can show them finishing. Conversions running in the current process are never reported as pending or started twice.
 
-Second, optionally, let the pipeline ask for extra execution time when the app is backgrounded between transfers. This keeps the package free of UIKit:
-
-```swift
-struct UIKitBackgroundActivity: BackgroundActivityProviding {
-    func beginActivity(named name: String) -> BackgroundActivityToken? {
-        var identifier = UIBackgroundTaskIdentifier.invalid
-        identifier = UIApplication.shared.beginBackgroundTask(withName: name) {
-            UIApplication.shared.endBackgroundTask(identifier)   // expiration: must end it
-            identifier = .invalid
-        }
-        return identifier == .invalid ? nil : BackgroundActivityToken(rawValue: identifier.rawValue)
-    }
-    func endActivity(_ token: BackgroundActivityToken) {
-        UIApplication.shared.endBackgroundTask(UIBackgroundTaskIdentifier(rawValue: token.rawValue))
-    }
-}
-```
-
-Then set `configuration.backgroundActivity = UIKitBackgroundActivity()`.
+Background time between transfers (creating the job, polling, moving the output into place) is asked for by `SystemBackgroundActivity`, the default `backgroundActivity`: `ProcessInfo.performExpiringActivity`, the time `beginBackgroundTask` gives, without UIKit. Set `NoBackgroundActivity()` if your app manages it itself.
 
 ### Interrupted conversions
 
@@ -301,30 +310,33 @@ do {
 }
 ```
 
-`resumePendingConversions(where:)` resumes only the records it accepts (by `id`, or by `userInfo` for conversions your own layer started) and leaves every other record untouched. Otherwise `resumePendingConversions()` at the next launch picks it up, and `discardPendingConversion(id:)` gives it up and deletes the job.
+`resumePendingConversions(where:)` resumes only the records it accepts (by `id`, `key`, or by `userInfo` for conversions your own layer started) and leaves every other record untouched. Otherwise `resumePendingConversions()` at the next launch picks it up, and `discardPendingConversion(id:)` or `discardPendingConversions(where:)` gives it up and deletes the job. `ConversionRecord.canResume` says whether a record still can (its job has not expired, its staged copies are there).
+
+With `resumesWhenOnline = true` the engine does this itself: the conversions this process kept because the network stayed away continue when it returns. Their handles arrive through `engine.automaticResumes()` and `resumedConversion(id:)`, and `ConversionViewModel` follows them. Conversions kept by an earlier launch are left for the app to offer. A request with a `key` simply continues the kept conversion when it is converted again.
 
 A record already running is never resumed twice, so a second caller gets no handle for it. `resumedConversion(id:)` gives that caller another handle on the run, and on its result once it has ended; it returns `nil` for one that failed for good or was cancelled, which starts over.
 
 ### macOS
 
-Everything builds and the whole test suite runs natively. There is no `handleEventsForBackgroundURLSession` to wire, so skip that step; `usesBackgroundTransfers = false` is fine. Sandboxed apps get security-scoped `NSOpenPanel` URLs, which staging already handles. If your app can be App-Napped mid-conversion, implement `BackgroundActivityProviding` with `ProcessInfo.processInfo.beginActivity(options:reason:)` instead of the UIKit version above.
+Everything builds and the whole test suite runs natively. There is no `handleEventsForBackgroundURLSession` to wire, so skip that step. A background session lets a transfer survive a quit and re-attach at the next launch, but on some networks `nsurlsessiond` uploads far slower than a standard session; `usesBackgroundTransfers = false` trades that survival for speed. Sandboxed apps get security-scoped `NSOpenPanel` URLs, which staging already handles. The default `SystemBackgroundActivity` holds a `ProcessInfo` activity during a conversion, so App Nap doesn't throttle it; the Mac may still idle-sleep, and a conversion kept meanwhile continues on wake.
 
 ## Public API surface
 
 | Area | Types | Notes |
 |---|---|---|
-| Orchestration | `ConversionEngine` — `convert`, `run`, `start`, `pendingConversions`, `resumePendingConversions`, `resumePendingConversions(where:)`, `resumedConversion(id:)`, `discardPendingConversion`, `availableOperations`, `apiClient` | One instance per app |
+| Orchestration | `ConversionEngine` — `convert`, `run`, `start`, `cancel(id:)`, `cancelAll`, `pendingConversions`, `resumePendingConversions`, `resumePendingConversions(where:)`, `resumedConversion(id:)`, `automaticResumes`, `discardPendingConversion`, `discardPendingConversions(where:)`, `creditBalance`, `catalog`, `availableOperations`, `apiClient` | One instance per app |
 | Handles | `ConversionHandle` — `id`, `progress: AsyncStream`, `result`, `cancel()`, `isCancelled` | Returned by `start` / queue / resume |
 | Batching | `ConversionQueue` — `enqueue(request)`, `enqueue(spec)`, `cancel(id:)`, `cancelAll()` | Actor; bounds concurrency |
-| Requests | `ConversionRequest`, `ProcessingOperation`, `InputFile`, `ExportOptions`, `OutputOptions` | The everyday entry point |
+| Requests | `ConversionRequest` (`key`, `followUps`), `ProcessingOperation`, `ProcessingStep`, `InputFile`, `ExportOptions`, `OutputOptions` | The everyday entry point |
+| Catalogue | `CloudConvertCatalog`, `ConversionPair`, `CatalogIssue` | Cached formats and options |
 | Job graphs | `JobBuilder`, `JobSpecification`, `TaskDefinition`, `TaskRef`, `CCOperationName` | Any CloudConvert task graph |
 | Progress / result | `ConversionProgress` (+ `Stage`, `RetryScope`), `ConversionResult`, `ConvertedFile` | Sendable value types |
-| Errors | `CloudConvertError`, `TaskFailureCode`, `APIErrorPayload`, `ConversionPhase` | One taxonomy for everything |
-| Configuration | `CloudConvertConfiguration`, `CloudConvertEnvironment`, `RetryPolicy`, `PollingPolicy`, `ProgressWeights` | All tunables in one struct |
+| Errors | `CloudConvertError` (+ `Category`), `TaskFailureCode`, `APIErrorPayload`, `ConversionPhase`, `CloudConvertLocalization` | One taxonomy for everything |
+| Configuration | `CloudConvertConfiguration`, `CloudConvertEnvironment`, `RetryPolicy`, `PollingPolicy`, `ProgressWeights`, `AccountObserving`, `SystemBackgroundActivity` | All tunables in one struct |
 | Endpoints | `CloudConvertAPIClient` — jobs (`create`, `get`, `list`, `delete`), tasks (`get`, `retry`, `cancel`, `delete`), `operations`, `convertFormats`, `currentUser` | `CloudConvertAPI` is the URLSession implementation |
 | Models | `CCJob`, `CCTask`, `CCTaskResult`, `CCUploadForm`, `CCExportedFile`, `CCOperation`, `CCOperationOption`, `CCUser`, `CCPage`, `CCStatus`, `JSONValue` | Lenient decoding |
 | Seams | `AuthorizationProvider`, `HTTPTransport`, `FileTransferring`, `ConnectivityMonitoring`, `ConversionRecordStoring`, `CloudConvertLogging`, `BackgroundActivityProviding` | Implement to replace or fake a layer |
-| Persistence | `ConversionRecord`, `ConversionRecordStore`, `PersistedTransfer`, `TransferOutcome` | Crash-safe state |
+| Persistence | `ConversionRecord`, `ConversionRecordStore`, `UnreadableRecord`, `PersistedTransfer`, `TransferOutcome` | Crash-safe state |
 
 Progress handlers and `AsyncStream`s deliver values on arbitrary threads; hop to the main actor in your app.
 
@@ -336,12 +348,23 @@ Progress handlers and `AsyncStream`s deliver values on arbitrary threads; hop to
 
 Every failure is a `CloudConvertError`:
 
-- `userFacingMessage` — safe alert text, never contains URLs or text from the server (that stays in the error's associated values, for logs)
+- `category` — whom to blame: `.input` (the user's file), `.unsupported` (the pair or an option), `.device` (free space), `.connectivity`, `.paused` (kept to resume), `.account` (credentials or credits: the developer's problem, not the user's), `.service` (trying again may work), `.cancelled`
+- `userFacingMessage` — safe alert text, never contains URLs, text from the server or the developer (that stays in the error's associated values, for logs); `recoverySuggestion` says what to do, when there is something to say
 - `isRetryable` — whether offering a "Try again" button makes sense
 - `isCancellation` — show nothing, or a neutral "Cancelled" state
 - `isConnectivityRelated` — show an offline banner rather than an error alert
 - `isResumable` — the conversion was kept: resume it, don't start it again (see [Interrupted conversions](#interrupted-conversions))
-- `analyticsCode` — stable string for analytics dashboards (`http_429`, `job_failed_invalid_conversion_type`, `upload_rejected_403`, …)
+- `analyticsCode` — stable string for analytics dashboards (`http_429`, `job_failed_invalidConversionType`, `upload_rejected_403`, …)
+
+Messages and stage descriptions go through `CloudConvertLocalization`, with stable keys (`messageKey`); the English text is the default:
+
+```swift
+CloudConvertLocalization.setProvider { key, english in
+    NSLocalizedString(key, tableName: "CloudConvertKit", value: english, comment: "")
+}
+```
+
+`configuration.accountObserver` is told when a conversion stops because of the account (`isAccountProblem`), and, with `lowCreditThreshold`, when the balance runs low, so the developer hears of a revoked key or an empty account before the reviews do.
 
 Log messages carry ids, phases and codes. File names, CloudConvert's task messages and response bodies go in the `metadata` of `CloudConvertLogging`, which the default `OSLogCloudConvertLogger` records as private.
 
@@ -364,12 +387,15 @@ Log messages carry ids, phases and codes. File names, CloudConvert's task messag
 | Records older than 20 h | Not resumed, since the server purges jobs at 24 h; cleaned up and reported as `.jobLost` |
 | 429 rate limit | `Retry-After` honoured (up to 10 minutes), falling back to backoff; the queue limits concurrent job creation |
 | 5xx, malformed JSON, or HTML from a CDN | Retried with exponential backoff and jitter (5 attempts for API calls) |
-| 401 | One transparent credential refresh via `AuthorizationProvider.handleUnauthorized()`, then fails without further retries |
+| 401 | One transparent credential refresh via `AuthorizationProvider.handleUnauthorized(rejected:)`, then fails without further retries. Requests refused together with the same key fetch once |
+| The key can't be fetched (store down, key missing) | `.authorizationFailed` (category `.account`), not retried; the fetch is not repeated for `failureCooldown` |
 | 402 (credits), 403, 422 | Not retried; specific error cases with safe user text |
 | Upload form expired, or storage returned 4xx | The whole job is rebuilt with a fresh form, once by default. The device clock may be wrong, so it only judges forms a previous launch received, and only while a rebuild is still allowed |
 | Storage returned 5xx on upload | The same request is retried against the same form |
 | Task error `TIMEOUT`, `INPUT_TASK_FAILED`, or an unknown code | Job rebuilt once |
-| Task error `INVALID_CONVERSION_TYPE`, `CONVERSION_FAILED`, `OPEN_FAILED`, `SANDBOX_FILE_NOT_ALLOWED`, `FILE_TOO_LARGE` | Not retried, since it would only burn credits; the user gets a specific message |
+| Task error `INVALID_CONVERSION_TYPE`, `CONVERSION_FAILED`, `OPEN_FAILED`, `SANDBOX_FILE_NOT_ALLOWED`, `FILE_TOO_LARGE`, `EXPORT_FAILED`, `UNKNOWN_ERROR` | Not retried, since it would only burn credits; the user gets a specific message |
+| Offline during a background transfer | The session waits by itself; the stage reports `.waitingForNetwork` meanwhile, and goes back when the network does |
+| A record a release can't read | Removed at engine init, with its job and files |
 | Job disappears (404) | `.jobLost`, rebuilt once |
 | Job stuck in `processing` past `polling.jobTimeout` | Checked once more; if still running, `.jobTimedOut` (`isResumable`): the job and the record are kept for `resumePendingConversions()` |
 | Finished job with no exported files | `.exportMissing`, not retried |
@@ -384,7 +410,7 @@ Log messages carry ids, phases and codes. File names, CloudConvert's task messag
 | Document-picker or Photos URLs | Security scope handled; the file is copied via `NSFileCoordinator` into the package's staging directory |
 | Large files | The staging copy and the multipart body are written in 1 MiB chunks on a dedicated IO queue, never in memory and never on a Swift-concurrency thread |
 | User cancels, in any phase including the delay before a rebuild, while queued, or while waiting for the network | URLSession tasks cancelled, temporary files removed, server job deleted, record removed, exactly one `.cancelled` stage. A cancellation is never kept to resume, even when the network wait gives up at that moment |
-| Success | The server job is deleted immediately for privacy, temporary files removed, record removed |
+| Success | The server job is deleted immediately for privacy, temporary files removed, record removed. Outputs are saved readable by everyone (0644), not URLSession's 0600 |
 | Crash leaving temporary files behind | Anything older than 48 h is purged at engine init |
 | Unknown future job or task status string | Decoded as `processing` so polling continues instead of crashing |
 | Odd catalogue rows (booleans as 0/1, numbers as strings) | Models decode leniently; one odd row never breaks the list |
@@ -402,7 +428,7 @@ Log messages carry ids, phases and codes. File names, CloudConvert's task messag
 1. Expose the same paths under its base URL: `POST /jobs`, `GET /jobs`, `GET /jobs/{id}`, `DELETE /jobs/{id}`, `GET /tasks/{id}`, `POST /tasks/{id}/retry`, `POST /tasks/{id}/cancel`, `DELETE /tasks/{id}`, and optionally `GET /operations`, `GET /convert/formats`, `GET /users/me`.
 2. Forward the request body and query string unchanged to `https://api.cloudconvert.com/v2/…` (or a regional host) with `Authorization: Bearer <API key>` added server-side.
 3. Return CloudConvert's status code and JSON body unchanged, **including** the `Retry-After`, `X-RateLimit-Limit` and `X-RateLimit-Remaining` headers, which the package reads.
-4. Authenticate the app however you like. The package sends whatever `AuthorizationProvider` returns as the `Authorization` header plus `additionalHeaders()`; on a 401 it calls `handleUnauthorized()` once and retries with fresh credentials.
+4. Authenticate the app however you like. The package sends whatever `AuthorizationProvider` returns as the `Authorization` header plus `additionalHeaders()`; on a 401 it calls `handleUnauthorized(rejected:)` once and retries with fresh credentials.
 
 Uploads (`upload.cloudconvert.com`) and downloads (`storage.cloudconvert.com`) go directly to CloudConvert storage using the pre-signed form and URLs from the job response, so the proxy never carries file bytes.
 
@@ -432,7 +458,9 @@ The package ships a privacy manifest (`PrivacyInfo.xcprivacy`) declaring the req
 swift test
 ```
 
-The suite runs entirely against in-memory fakes for the API, the transfer layer and connectivity. It covers the happy path, output naming, multi-file export, deterministic versus transient failure handling, upload rejection leading to a job rebuild, storage 5xx retrying against the same form, offline timeouts, cancellation cleanup both mid-upload and during a rebuild delay, resuming from a persisted record without re-uploading, running conversions being excluded from "pending", conversions kept when the network or the polling deadline runs out and resumed later, re-attached transfers that failed or were cancelled by the system, a resume followed by a second caller or by the SwiftUI model, queue concurrency, retry and backoff arithmetic, values from the server that must not trap, error mapping, and model decoding.
+The suite runs entirely against in-memory fakes for the API, the transfer layer and connectivity, the ones `CloudConvertKitTesting` ships. It covers the happy path, output naming, multi-file export, deterministic versus transient failure handling, upload rejection leading to a job rebuild, storage 5xx retrying against the same form, offline timeouts, cancellation cleanup both mid-upload and during a rebuild delay, resuming from a persisted record without re-uploading, running conversions being excluded from "pending", conversions kept when the network or the polling deadline runs out and resumed later, re-attached transfers that failed or were cancelled by the system, a resume followed by a second caller or by the SwiftUI model, queue concurrency, retry and backoff arithmetic, values from the server that must not trap, error mapping, and model decoding.
+
+Tests are grouped by subject: `ErrorTests`, `DecodingTests`, `RequestTests`, `NetworkingTests`, `TransferTests`, `EngineTests`, `ResumeTests`, `CatalogTests`, `ViewModelTests` and `StressTests`, with shared helpers in `TestSupport`. The helpers that wait on asynchronous work (`waitUntil`, `withTimeout`) give up after a limit, so a regression fails instead of hanging the suite.
 
 `Tests/CloudConvertKitTests/Fixtures/` holds real `GET /v2/jobs/{id}` responses (a finished job and a failed one, signed URLs redacted). The regression tests run them through the real `CloudConvertAPI` decoder, and the fakes follow the same shapes: only export tasks list files with a `url`, and an engine that cannot convert a file reports `code: null`.
 
@@ -444,7 +472,22 @@ CCK_STRESS_SEED=1790701569452 CCK_STRESS_COUNT=1000 swift test --filter StressTe
 
 Run the suite under Thread Sanitizer with `swift test --sanitize=thread`. Codesign rejects test bundles built under `~/Documents` (Finder metadata), so build elsewhere there: `swift test --scratch-path /tmp/cck-build`.
 
-For a live smoke test use `CloudConvertConfiguration.direct(apiKey:environment: .sandbox, …)` with a file whitelisted in the CloudConvert sandbox dashboard.
+For a live smoke test use `CloudConvertConfiguration.direct(apiKey:environment: .sandbox)` with a file whitelisted in the CloudConvert sandbox dashboard.
+
+`CloudConvertKitSwift6Tests` builds in the Swift 6 language mode, using the kit as an app does.
+
+## Migrating from 1.x
+
+- **Toolchain:** Swift 6 (Xcode 16+). Platforms are unchanged.
+- **`direct(apiKey:environment:)`** takes no default environment any more; pass one.
+- **`AuthorizationProvider.handleUnauthorized()`** is now `handleUnauthorized(rejected:)`, with the refused `Authorization` value. A custom provider that implemented the old one must rename it, or it silently gets the default (`false`: no refresh).
+- **`setBackgroundCompletionHandler`** takes a plain `() -> Void`. Prefer `BackgroundTransferManager.handleEventsForBackgroundURLSession(identifier:completionHandler:)`, which keeps a handler that arrives before the engine.
+- **`maxConcurrentConversions`** is applied by the engine to every conversion (it was the queue's default only). An app that relied on running more at once raises it.
+- **`backgroundActivity`** defaults to `SystemBackgroundActivity()`; a UIKit adapter of your own still works, or set `NoBackgroundActivity()`.
+- **New `CloudConvertError.authorizationFailed`** and **`TaskFailureCode.exportFailed` / `.unknownError`**: an exhaustive `switch` needs the cases.
+- **`invalidRequest`'s message** no longer includes the reason; it stays in the associated value.
+- **`analyticsCode` for task failures** is `job_failed_<code>` with the case name as before (`job_failed_exportFailed`); codes the kit didn't know in 1.x (`EXPORT_FAILED`, `UNKNOWN_ERROR`) were `job_failed_export_failed` / `job_failed_unknown_error`.
+- Messages are unchanged in English; route them through `CloudConvertLocalization` to translate.
 
 ## Contributing
 

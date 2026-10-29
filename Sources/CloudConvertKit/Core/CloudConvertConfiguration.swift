@@ -126,7 +126,10 @@ public struct CloudConvertConfiguration: Sendable {
     /// Local cap on input size; the upload form also carries `max_file_size`
     /// and the smaller of the two is enforced.
     public var maxInputFileSize: Int64
-    /// Maximum number of conversions the queue runs simultaneously.
+    /// Maximum number of conversions the engine runs at once: those started
+    /// with `convert`/`run`/`start`, through a `ConversionQueue`, and the
+    /// ones `resumePendingConversions` continues alike. Others wait, at
+    /// `.preparing`, for a slot. `Int.max` for no limit.
     public var maxConcurrentConversions: Int
     /// Extra free space to require beyond the expected output size.
     public var diskSpaceSafetyMargin: Int64
@@ -157,6 +160,39 @@ public struct CloudConvertConfiguration: Sendable {
     /// Free-form `tag` sent with every job (e.g. app name + version) to make
     /// jobs identifiable in the CloudConvert dashboard.
     public var jobTag: String?
+
+    // MARK: Account
+
+    /// Told when a conversion stops because of the account or the app's
+    /// credentials (`CloudConvertError.isAccountProblem`), and when credits
+    /// run low. For the developer's reporting, not for the user.
+    public var accountObserver: (any AccountObserving)?
+    /// With an `accountObserver`, the balance is checked after conversions
+    /// (at most every ten minutes) and `creditsRunningLow` called below this.
+    /// Needs the `user.read` scope.
+    public var lowCreditThreshold: Int?
+
+    // MARK: Resuming
+
+    /// When the network comes back, continue the conversions this process
+    /// kept because the network stayed away (or their job ran long). Their
+    /// handles arrive through `ConversionEngine.automaticResumes()` and
+    /// `resumedConversion(id:)`. Conversions kept by an earlier launch are
+    /// left for the app to offer.
+    public var resumesWhenOnline: Bool
+
+    // MARK: Catalogue
+
+    /// Check each `ConversionRequest` against the formats catalogue before
+    /// anything is staged or uploaded: an unsupported pair, a known failing
+    /// one or an option the operation doesn't take fails at once with
+    /// `.invalidRequest`, instead of after the upload, spending credits.
+    /// Skipped when the catalogue can't be loaded.
+    public var validatesRequests: Bool
+    /// Pairs CloudConvert offers but fails on. `ConversionPair.knownFailures` by default.
+    public var knownFailingConversions: Set<ConversionPair>
+    /// How long a downloaded catalogue is used before it is fetched again.
+    public var catalogMaxAge: TimeInterval
 
     public init(environment: CloudConvertEnvironment,
                 authorizationProvider: any AuthorizationProvider,
@@ -192,7 +228,14 @@ public struct CloudConvertConfiguration: Sendable {
         self.usesBackgroundTransfers = true
         self.allowsCellularTransfers = true
         self.progressWeights = .default
-        self.backgroundActivity = NoBackgroundActivity()
+        self.backgroundActivity = SystemBackgroundActivity()
+
+        self.accountObserver = nil
+        self.lowCreditThreshold = nil
+        self.resumesWhenOnline = false
+        self.validatesRequests = false
+        self.knownFailingConversions = ConversionPair.knownFailures
+        self.catalogMaxAge = 7 * 24 * 60 * 60
     }
 
     /// `Application Support/<bundle id>/CloudConvertKit/`.
@@ -229,19 +272,64 @@ public extension CloudConvertConfiguration {
                                   jobTag: jobTag)
     }
 
-    /// Talk to CloudConvert directly with an API key (development / sandbox).
-    ///
-    /// - Important: `environment` defaults to **`.sandbox`**, not `.production`.
-    ///   A production API key used against the sandbox is rejected with 401
-    ///   (`CloudConvertError.unauthorized`). Always pass `environment:`
-    ///   explicitly; the default will be removed in the next major version.
+    /// Talk to CloudConvert directly with an API key. A production key used
+    /// against `.sandbox` is rejected with 401, and the other way round.
     static func direct(apiKey: String,
-                       environment: CloudConvertEnvironment = .sandbox,
-                       backgroundSessionIdentifier: String,
-                       jobTag: String? = nil) -> CloudConvertConfiguration {
+                       environment: CloudConvertEnvironment,
+                       backgroundSessionIdentifier: String = defaultBackgroundSessionIdentifier,
+                       jobTag: String? = defaultJobTag) -> CloudConvertConfiguration {
         CloudConvertConfiguration(environment: environment,
                                   authorizationProvider: StaticAPIKeyAuthorization(apiKey: apiKey),
                                   backgroundSessionIdentifier: backgroundSessionIdentifier,
                                   jobTag: jobTag)
     }
+
+    /// Talk to CloudConvert directly with a key the app fetches at runtime
+    /// (Firebase Realtime Database, Remote Config…), cached until a 401 (see
+    /// `RefreshableTokenAuthorization`). The whole setup most apps need:
+    ///
+    ///     let configuration = CloudConvertConfiguration.fetchingKey {
+    ///         try await KeyStore.cloudConvertKey()
+    ///     }
+    static func fetchingKey(environment: CloudConvertEnvironment = .production,
+                            backgroundSessionIdentifier: String = defaultBackgroundSessionIdentifier,
+                            jobTag: String? = defaultJobTag,
+                            _ fetchKey: @escaping RefreshableTokenAuthorization.TokenFetcher) -> CloudConvertConfiguration {
+        CloudConvertConfiguration(environment: environment,
+                                  authorizationProvider: RefreshableTokenAuthorization(fetcher: fetchKey),
+                                  backgroundSessionIdentifier: backgroundSessionIdentifier,
+                                  jobTag: jobTag)
+    }
+
+    /// `<bundle id>.cloudconvert`: unique per app and stable across launches.
+    static var defaultBackgroundSessionIdentifier: String {
+        "\(Bundle.main.bundleIdentifier ?? "CloudConvertKit").cloudconvert"
+    }
+
+    /// `<bundle id> <version> (<platform>)`, to tell apps and releases
+    /// apart in the CloudConvert dashboard.
+    static var defaultJobTag: String? {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return nil }
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+        #if os(macOS)
+        let platform = "macOS"
+        #else
+        let platform = "iOS"
+        #endif
+        return "\(bundleID) \(version) (\(platform))"
+    }
+}
+
+/// Told about what the developer, not the user, has to act on.
+public protocol AccountObserving: Sendable {
+    /// A conversion stopped because of the account or the app's credentials:
+    /// a refused or missing key, no credits left. Called once per conversion.
+    func conversionStopped(byAccountProblem error: CloudConvertError)
+    /// The balance fell below `lowCreditThreshold`.
+    func creditsRunningLow(remaining: Int)
+}
+
+public extension AccountObserving {
+    func conversionStopped(byAccountProblem error: CloudConvertError) {}
+    func creditsRunningLow(remaining: Int) {}
 }

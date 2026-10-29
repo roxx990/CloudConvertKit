@@ -260,7 +260,7 @@ public final class CloudConvertAPI: CloudConvertAPIClient, @unchecked Sendable {
         var response = try await transport.send(request)
         logger.debug("\(label): \(method) /\(path) → \(response.status)", metadata: response.rateLimitRemaining.map { ["rateLimitRemaining": String($0)] } ?? [:])
 
-        if response.status == 401, await authorization.handleUnauthorized() {
+        if response.status == 401, await authorization.handleUnauthorized(rejected: request.value(forHTTPHeaderField: "Authorization")) {
             request = try await makeRequest(method: method, path: path, query: query, body: body)
             response = try await transport.send(request)
         }
@@ -286,14 +286,32 @@ public final class CloudConvertAPI: CloudConvertAPIClient, @unchecked Sendable {
             request.httpBody = body
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
-        if let auth = try await authorization.authorizationHeaderValue() {
+        let (auth, headers) = try await credentials()
+        if let auth {
             request.setValue(auth, forHTTPHeaderField: "Authorization")
         }
-        for (key, value) in try await authorization.additionalHeaders() {
+        for (key, value) in headers {
             request.setValue(value, forHTTPHeaderField: key)
         }
         request.setValue(CloudConvertAPI.userAgent, forHTTPHeaderField: "User-Agent")
         return request
+    }
+
+    /// The provider's credentials. Its own failures (a key store that is
+    /// down, or holds no key) are `.authorizationFailed`, which is not
+    /// retried: they would otherwise look like a server hiccup and be
+    /// fetched again on every retry.
+    private func credentials() async throws -> (String?, [String: String]) {
+        do {
+            return (try await authorization.authorizationHeaderValue(), try await authorization.additionalHeaders())
+        } catch let error as CloudConvertError {
+            throw error
+        } catch is CancellationError {
+            throw CloudConvertError.cancelled
+        } catch {
+            logger.error("The authorization provider failed", metadata: ["error": String(describing: error)])
+            throw CloudConvertError.authorizationFailed(underlying: String(describing: error))
+        }
     }
 
     static let userAgent: String = {
@@ -309,6 +327,6 @@ public final class CloudConvertAPI: CloudConvertAPIClient, @unchecked Sendable {
         #else
         let platform = "Apple"
         #endif
-        return "\(name)/\(version) CloudConvertKit/1.0 (\(platform))"
+        return "\(name)/\(version) CloudConvertKit/\(CloudConvertKitInfo.version) (\(platform))"
     }()
 }

@@ -140,6 +140,9 @@ public struct FileStorage: Sendable {
             try? FileManager.default.removeItem(at: destination)
             throw CloudConvertError.storage(reason: "Could not move output into place: \(error.localizedDescription)")
         }
+        // URLSession saves downloads readable by their owner only (0600);
+        // an output is the user's file, like any other they make.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: destination.path)
         return destination
     }
 

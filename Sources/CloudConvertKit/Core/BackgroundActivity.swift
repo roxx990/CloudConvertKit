@@ -1,6 +1,6 @@
 //  Lets the host app keep the process alive for a short while after it is
-//  backgrounded (UIKit's `beginBackgroundTask`) without the kit importing
-//  UIKit. Uploads and downloads already run on a background URLSession; this
+//  backgrounded without the kit importing UIKit. `SystemBackgroundActivity`
+//  (the default) does it with Foundation alone. Uploads and downloads already run on a background URLSession; this
 //  only matters for the seconds between them (creating the job, polling,
 //  moving the output into place).
 //
@@ -21,8 +21,7 @@ public protocol BackgroundActivityProviding: Sendable {
     func endActivity(_ token: BackgroundActivityToken)
 }
 
-/// Default: does nothing. Correct for macOS and for apps that prefer not to
-/// request background time.
+/// Does nothing: for an app that manages background time itself.
 public struct NoBackgroundActivity: BackgroundActivityProviding {
     public init() {}
     public func beginActivity(named name: String) -> BackgroundActivityToken? { nil }
@@ -45,3 +44,57 @@ public struct NoBackgroundActivity: BackgroundActivityProviding {
 //             UIApplication.shared.endBackgroundTask(UIBackgroundTaskIdentifier(rawValue: token.rawValue))
 //         }
 //     }
+
+/// The default, with Foundation alone:
+/// - macOS: a `ProcessInfo` activity, so App Nap doesn't throttle polling
+///   and the move into place. The Mac may still idle-sleep; a conversion
+///   kept meanwhile continues on wake.
+/// - iOS: `ProcessInfo.performExpiringActivity`, the background time
+///   `beginBackgroundTask` gives, without UIKit. When the system takes it
+///   back the conversion simply carries on at the next launch or resume.
+public final class SystemBackgroundActivity: BackgroundActivityProviding, @unchecked Sendable {
+
+    private let lock = NSLock()
+    private var next = 1
+    #if os(macOS)
+    private var activities: [Int: NSObjectProtocol] = [:]
+    #else
+    private var releases: [Int: DispatchSemaphore] = [:]
+    #endif
+
+    public init() {}
+
+    public func beginActivity(named name: String) -> BackgroundActivityToken? {
+        lock.lock()
+        let id = next
+        next += 1
+        lock.unlock()
+        #if os(macOS)
+        let activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep], reason: name)
+        lock.lock(); activities[id] = activity; lock.unlock()
+        #else
+        // The activity lasts while its block runs, so the block waits, on
+        // a thread of its own, until `endActivity` (or the system, with
+        // `expired`) releases it.
+        let release = DispatchSemaphore(value: 0)
+        lock.lock(); releases[id] = release; lock.unlock()
+        ProcessInfo.processInfo.performExpiringActivity(withReason: name) { expired in
+            if expired { release.signal() } else { release.wait() }
+        }
+        #endif
+        return BackgroundActivityToken(rawValue: id)
+    }
+
+    public func endActivity(_ token: BackgroundActivityToken) {
+        lock.lock()
+        #if os(macOS)
+        let activity = activities.removeValue(forKey: token.rawValue)
+        lock.unlock()
+        if let activity { ProcessInfo.processInfo.endActivity(activity) }
+        #else
+        let release = releases.removeValue(forKey: token.rawValue)
+        lock.unlock()
+        release?.signal()
+        #endif
+    }
+}

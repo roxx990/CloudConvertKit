@@ -352,6 +352,14 @@ public struct CCUser: Decodable, Equatable, Sendable {
         credits = CCLenient.int(container, .credits)
         createdAt = try? container.decodeIfPresent(Date.self, forKey: .createdAt)
     }
+
+    public init(id: String, username: String? = nil, email: String? = nil, credits: Int?, createdAt: Date? = nil) {
+        self.id = id
+        self.username = username
+        self.email = email
+        self.credits = credits
+        self.createdAt = createdAt
+    }
 }
 
 // MARK: - Pagination (GET /jobs, GET /tasks)
@@ -396,7 +404,7 @@ public struct CCPage<Item: Decodable>: Decodable {
         meta = try? container.decodeIfPresent(CCPageMeta.self, forKey: .meta)
     }
 
-    init(data: [Item], meta: CCPageMeta?) {
+    public init(data: [Item], meta: CCPageMeta?) {
         self.data = data
         self.meta = meta
     }

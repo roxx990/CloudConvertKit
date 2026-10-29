@@ -20,6 +20,8 @@ public enum TaskFailureCode: Equatable, Sendable {
     case openFailed             // engine could not open (corrupt / password protected)
     case fileTooLarge
     case insufficientCredits
+    case exportFailed           // the engine produced no output (office engines on DOC/PPT)
+    case unknownError           // the engine failed without saying why
     case other(String)
 
     public init(rawCode: String?) {
@@ -35,6 +37,8 @@ public enum TaskFailureCode: Equatable, Sendable {
         case "OPEN_FAILED": self = .openFailed
         case "FILE_TOO_LARGE", "FILE_SIZE_EXCEEDED": self = .fileTooLarge
         case "INSUFFICIENT_CREDITS", "PAYMENT_REQUIRED": self = .insufficientCredits
+        case "EXPORT_FAILED": self = .exportFailed
+        case "UNKNOWN_ERROR": self = .unknownError
         case .some(let code): self = .other(code)
         case .none: self = .other("UNKNOWN")
         }
@@ -64,7 +68,8 @@ public enum TaskFailureCode: Equatable, Sendable {
         case .timeout, .inputTaskFailed, .downloadFailed, .uploadFailed:
             return true
         case .conversionFailed, .invalidConversionType, .sandboxFileNotAllowed,
-             .cancelled, .openFailed, .fileTooLarge, .insufficientCredits, .other:
+             .cancelled, .openFailed, .fileTooLarge, .insufficientCredits,
+             .exportFailed, .unknownError, .other:
             return false
         }
     }
@@ -147,6 +152,11 @@ public enum CloudConvertError: Error, Sendable {
     case insufficientDiskSpace(required: Int64, available: Int64)
     case invalidRequest(reason: String)
     case storage(reason: String)
+    /// The `AuthorizationProvider` could not supply credentials: the key
+    /// fetch failed (the remote store is unreachable, or holds no key).
+    /// Not retried: the same fetch would fail again. `underlying` is the
+    /// provider's error, for logs.
+    case authorizationFailed(underlying: String)
 
     // Connectivity
     case notConnected
@@ -214,7 +224,7 @@ public extension CloudConvertError {
             // request. Never a reason to rebuild the job (see `requiresNewJob`).
             return true
         case .fileNotFound, .fileNotReadable, .emptyFile, .fileTooLarge, .insufficientDiskSpace,
-             .invalidRequest, .storage, .cancelled, .unauthorized, .paymentRequired, .forbidden,
+             .invalidRequest, .storage, .authorizationFailed, .cancelled, .unauthorized, .paymentRequired, .forbidden,
              .notFound, .validation, .uploadFormInvalid, .exportMissing, .jobTimedOut, .retriesExhausted:
             return false
         }
@@ -358,91 +368,192 @@ public extension CloudConvertError {
     }
 }
 
+// MARK: - Category
+
+public extension CloudConvertError {
+
+    /// What kind of problem stopped the conversion: what a UI says, and
+    /// whom it blames.
+    enum Category: String, Sendable, CaseIterable {
+        /// The user's file: missing, empty, too large, damaged, or one the
+        /// engines could not open or convert.
+        case input
+        /// This pair or option is not offered: an unsupported conversion, a
+        /// rejected option, a request the kit refused before sending it.
+        case unsupported
+        /// This device: not enough free space, a file that could not be saved.
+        case device
+        /// The network is away. Paused conversions (`isResumable`) are `.paused`.
+        case connectivity
+        /// Stopped while its job may still finish; it continues on a resume.
+        case paused
+        /// The CloudConvert account or the app's credentials: refused or
+        /// missing key, no credits left. Not the user's fault, and not fixed
+        /// by trying again: the developer needs to know (`AccountObserving`).
+        case account
+        /// CloudConvert or the transfer had trouble; trying again may work.
+        case service
+        /// The user (or the app) stopped it.
+        case cancelled
+    }
+
+    var category: Category {
+        if isResumable { return .paused }
+        switch self {
+        case .fileNotFound, .fileNotReadable, .emptyFile, .fileTooLarge:
+            return .input
+        case .insufficientDiskSpace, .storage:
+            return .device
+        case .invalidRequest, .validation:
+            return .unsupported
+        case .notConnected, .network, .timedOut:
+            return isConnectivityRelated ? .connectivity : .service
+        case .cancelled:
+            return .cancelled
+        case .authorizationFailed, .unauthorized, .forbidden, .paymentRequired:
+            return .account
+        case .notFound, .rateLimited, .serverError, .unexpectedStatus, .invalidResponse, .decoding,
+             .uploadFormInvalid, .uploadFormExpired, .uploadRejected, .exportMissing, .downloadFailed,
+             .transferLost, .jobLost, .jobTimedOut, .retriesExhausted:
+            return .service
+        case .jobFailed(_, _, let code, _):
+            switch code {
+            case .conversionFailed, .openFailed, .fileTooLarge: return .input
+            case .invalidConversionType, .sandboxFileNotAllowed, .exportFailed: return .unsupported
+            case .insufficientCredits: return .account
+            case .cancelled: return .cancelled
+            case .timeout, .inputTaskFailed, .downloadFailed, .uploadFailed, .unknownError, .other: return .service
+            }
+        }
+    }
+
+    /// The account or the app's credentials stopped the conversion (`.account`).
+    var isAccountProblem: Bool { category == .account }
+}
+
 // MARK: - User-facing text
 
 extension CloudConvertError: LocalizedError {
 
     public var errorDescription: String? { userFacingMessage }
 
-    /// A short message safe to show in an alert. Never contains URLs, tokens
-    /// or text from the server: the server's own explanation stays in the
-    /// associated values (`APIErrorPayload`, the task `message`), which
-    /// `String(describing:)` includes, for logs and support.
+    /// A short message safe to show in an alert, through
+    /// `CloudConvertLocalization`. Never contains URLs, tokens or text from
+    /// the server or the developer: those stay in the associated values,
+    /// which `String(describing:)` includes, for logs and support.
     public var userFacingMessage: String {
+        let (key, english) = message
+        if case .fileTooLarge(_, let size, let limit) = self {
+            return CloudConvertLocalization.format(key, english,
+                                                   ByteCountFormatter.string(fromByteCount: size, countStyle: .file),
+                                                   ByteCountFormatter.string(fromByteCount: limit, countStyle: .file))
+        }
+        return CloudConvertLocalization.string(key, english)
+    }
+
+    /// The localization key of `userFacingMessage`, for apps that keep their
+    /// own string tables.
+    public var messageKey: String { message.key }
+
+    /// What the user can do about it, when there is something to say.
+    public var recoverySuggestion: String? {
+        switch category {
+        case .paused:
+            return CloudConvertLocalization.string("cloudconvert.recovery.paused",
+                                                   "It continues where it stopped when you try again.")
+        case .connectivity:
+            return CloudConvertLocalization.string("cloudconvert.recovery.connectivity",
+                                                   "Check your internet connection and try again.")
+        case .service:
+            return CloudConvertLocalization.string("cloudconvert.recovery.service",
+                                                   "Try again in a moment.")
+        case .account:
+            return CloudConvertLocalization.string("cloudconvert.recovery.account",
+                                                   "Try again later. If it keeps happening, please contact support.")
+        case .input, .unsupported, .device, .cancelled:
+            return nil
+        }
+    }
+
+    private var message: (key: String, english: String) {
         switch self {
         case .fileNotFound:
-            return "The file could not be found. It may have been moved or deleted."
+            return ("cloudconvert.error.fileNotFound", "The file could not be found. It may have been moved or deleted.")
         case .fileNotReadable:
-            return "The file could not be read. Please pick it again."
+            return ("cloudconvert.error.fileNotReadable", "The file could not be read. Please pick it again.")
         case .emptyFile:
-            return "The file is empty and cannot be converted."
-        case .fileTooLarge(_, let size, let limit):
-            return "This file is too large (\(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))). The limit is \(ByteCountFormatter.string(fromByteCount: limit, countStyle: .file))."
+            return ("cloudconvert.error.emptyFile", "The file is empty and cannot be converted.")
+        case .fileTooLarge:
+            return ("cloudconvert.error.fileTooLarge", "This file is too large (%@). The limit is %@.")
         case .insufficientDiskSpace:
-            return "There is not enough free space on this device to save the converted file."
-        case .invalidRequest(let reason):
-            return "This conversion could not be started: \(reason)"
+            return ("cloudconvert.error.insufficientDiskSpace", "There is not enough free space on this device to save the converted file.")
+        case .invalidRequest:
+            return ("cloudconvert.error.invalidRequest", "This conversion could not be started.")
         case .storage:
-            return "The converted file could not be saved on this device."
+            return ("cloudconvert.error.storage", "The converted file could not be saved on this device.")
+        case .authorizationFailed:
+            return ("cloudconvert.error.authorizationFailed", "The conversion service could not be reached right now. Please try again later.")
         case .notConnected:
-            return "You appear to be offline. Check your connection and try again."
+            return ("cloudconvert.error.notConnected", "You appear to be offline. Check your connection and try again.")
         case .network:
-            return "A network error interrupted the conversion. Please try again."
+            return ("cloudconvert.error.network", "A network error interrupted the conversion. Please try again.")
         case .timedOut(.waitingForNetwork):
-            return "You appear to be offline. The conversion is paused and can continue once you're back online."
+            return ("cloudconvert.error.pausedOffline", "You appear to be offline. The conversion is paused and can continue once you're back online.")
         case .timedOut:
-            return "The connection timed out. Please try again."
+            return ("cloudconvert.error.timedOut", "The connection timed out. Please try again.")
         case .cancelled:
-            return "The conversion was cancelled."
+            return ("cloudconvert.error.cancelled", "The conversion was cancelled.")
         case .unauthorized, .forbidden:
-            return "The conversion service refused the request. Please update the app or try again later."
+            return ("cloudconvert.error.refused", "The conversion service refused the request. Please update the app or try again later.")
         case .paymentRequired:
-            return "The conversion service is temporarily unavailable. Please try again later."
+            return ("cloudconvert.error.unavailable", "The conversion service is temporarily unavailable. Please try again later.")
         case .notFound:
-            return "The conversion could not be found on the server. Please start again."
+            return ("cloudconvert.error.notFound", "The conversion could not be found on the server. Please start again.")
         case .validation:
-            return "The conversion request was rejected. This file type or option is not supported."
+            return ("cloudconvert.error.validation", "The conversion request was rejected. This file type or option is not supported.")
         case .rateLimited:
-            return "Too many conversions were started at once. Please wait a moment and try again."
+            return ("cloudconvert.error.rateLimited", "Too many conversions were started at once. Please wait a moment and try again.")
         case .serverError, .unexpectedStatus, .invalidResponse, .decoding:
-            return "The conversion service is having trouble right now. Please try again in a moment."
+            return ("cloudconvert.error.serviceTrouble", "The conversion service is having trouble right now. Please try again in a moment.")
         case .uploadFormInvalid, .uploadFormExpired:
-            return "The upload could not be started. Please try again."
+            return ("cloudconvert.error.uploadNotStarted", "The upload could not be started. Please try again.")
         case .uploadRejected:
-            return "The file could not be uploaded. Please try again."
+            return ("cloudconvert.error.uploadRejected", "The file could not be uploaded. Please try again.")
         case .exportMissing:
-            return "The conversion finished but no output file was produced."
+            return ("cloudconvert.error.exportMissing", "The conversion finished but no output file was produced.")
         case .downloadFailed:
-            return "The converted file could not be downloaded. Please try again."
+            return ("cloudconvert.error.downloadFailed", "The converted file could not be downloaded. Please try again.")
         case .transferLost:
-            return "The transfer was interrupted. Please try again."
+            return ("cloudconvert.error.transferLost", "The transfer was interrupted. Please try again.")
         case .jobFailed(_, _, let code, _):
             switch code {
             case .invalidConversionType:
-                return "Converting between these two formats is not supported."
+                return ("cloudconvert.error.job.invalidConversionType", "Converting between these two formats is not supported.")
             case .openFailed:
-                return "The file could not be opened. It may be corrupted or password protected."
+                return ("cloudconvert.error.job.openFailed", "The file could not be opened. It may be corrupted or password protected.")
             case .fileTooLarge:
-                return "This file is too large to convert."
+                return ("cloudconvert.error.job.fileTooLarge", "This file is too large to convert.")
             case .timeout:
-                return "The conversion took too long and was stopped. Try a smaller file."
+                return ("cloudconvert.error.job.timeout", "The conversion took too long and was stopped. Try a smaller file.")
             case .sandboxFileNotAllowed:
-                return "This file is not allowed in the sandbox environment."
+                return ("cloudconvert.error.job.sandboxFileNotAllowed", "This file is not allowed in the sandbox environment.")
             case .insufficientCredits:
-                return "The conversion service is temporarily unavailable. Please try again later."
+                return ("cloudconvert.error.unavailable", "The conversion service is temporarily unavailable. Please try again later.")
             case .cancelled:
-                return "The conversion was cancelled."
+                return ("cloudconvert.error.cancelled", "The conversion was cancelled.")
             case .conversionFailed:
-                return "This file could not be converted. It may be damaged or in an unsupported format."
-            default:
-                return "The conversion failed. Please try again or use a different file."
+                return ("cloudconvert.error.job.conversionFailed", "This file could not be converted. It may be damaged or in an unsupported format.")
+            case .exportFailed:
+                return ("cloudconvert.error.job.exportFailed", "This file could not be converted to this format.")
+            case .inputTaskFailed, .downloadFailed, .uploadFailed, .unknownError, .other:
+                return ("cloudconvert.error.job.failed", "The conversion failed. Please try again or use a different file.")
             }
         case .jobLost:
-            return "The conversion expired on the server. Please start again."
+            return ("cloudconvert.error.jobLost", "The conversion expired on the server. Please start again.")
         case .jobTimedOut:
-            return "The conversion is taking longer than expected. It is paused and can continue later."
+            return ("cloudconvert.error.jobTimedOut", "The conversion is taking longer than expected. It is paused and can continue later.")
         case .retriesExhausted:
-            return "The conversion failed after several attempts. Please try again later."
+            return ("cloudconvert.error.retriesExhausted", "The conversion failed after several attempts. Please try again later.")
         }
     }
 
@@ -456,6 +567,7 @@ extension CloudConvertError: LocalizedError {
         case .insufficientDiskSpace: return "insufficient_disk_space"
         case .invalidRequest: return "invalid_request"
         case .storage: return "storage"
+        case .authorizationFailed: return "authorization_failed"
         case .notConnected: return "not_connected"
         case .network(let code, _): return "network_\(code.rawValue)"
         case .timedOut(let phase): return "timed_out_\(phase.rawValue)"

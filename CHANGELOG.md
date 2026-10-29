@@ -1,5 +1,39 @@
 # Changelog
 
+## 2.0.0
+
+Fixes and additions from running the kit in production apps, on iOS and macOS. Breaking changes are listed under **Migrating from 1.x** in the README; in short: a Swift 6 toolchain, `direct(apiKey:environment:)` without a default environment, `handleUnauthorized(rejected:)`, `maxConcurrentConversions` applied by the engine, and new error cases.
+
+**Fixes**
+- **An upload no longer holds the file in memory.** `MultipartFormWriter` copied the file into the upload body in chunks that iOS's Foundation leaves for the thread's autorelease pool, which didn't drain until the whole file was copied. Each chunk is now freed as it goes: a 200 MB file held 198 MB on the iOS simulator, now almost nothing.
+- **A key that can't be fetched is no longer a server hiccup.** A failing `AuthorizationProvider` (the key store down, or empty) was wrapped as `.invalidResponse`, retried five times with a fetch each, then shown as "the service is having trouble". It is now `.authorizationFailed`: not retried, category `.account`.
+- **The background completion handler is never dropped.** One that arrived before the engine existed, or just after the session delivered its events, was lost and the system's handler never called. `BackgroundTransferManager.handleEventsForBackgroundURLSession(identifier:completionHandler:)` keeps it for the manager, and a late one is called at once. It takes UIKit's closure as it is, also in Swift 6.
+- **`RefreshableTokenAuthorization` fetches once.** Requests that need the key together share one fetch; a 401 drops the key only if it is the one refused, so requests refused together re-fetch once; a failed fetch is reported again without fetching for `failureCooldown` (10 s).
+- **"Waiting for network" during background transfers.** The session waits for the network by itself, so the stage stayed `.uploading`; it now reports `.waitingForNetwork` while offline.
+- **Credits are kept for a conversion resumed with only its downloads left** (`ConversionResult.credits` was nil).
+- **Outputs are saved 0644**, not URLSession's 0600.
+- **Resumed conversions count toward `maxConcurrentConversions`**, and `cancelAll()` reaches them.
+- **`outputFormatHint` follows the task feeding the export**, not the first processing task, so a multi-step job names and estimates its output by what it exports.
+- **Records a release can't read are cleaned up** (job deleted, files removed) instead of staying forever. Records carry a `formatVersion`.
+- `invalidRequest`'s message no longer shows developer text. The User-Agent carries the kit's real version.
+
+**Added**
+- **Error categories:** `CloudConvertError.category` (`.input`, `.unsupported`, `.device`, `.connectivity`, `.paused`, `.account`, `.service`, `.cancelled`), `isAccountProblem`, `recoverySuggestion`, `messageKey`.
+- **Localization:** `CloudConvertLocalization.setProvider`, with stable keys for every message and stage description.
+- **Task codes:** `EXPORT_FAILED` and `UNKNOWN_ERROR` are `.exportFailed` and `.unknownError`, not retried.
+- **Account observer:** `configuration.accountObserver` (`AccountObserving`) hears of account problems, and of a balance below `lowCreditThreshold`. `engine.creditBalance(maxAge:)`.
+- **Idempotent requests:** `ConversionRequest.key` continues the conversion kept for that key instead of billing the file again, and starts over only when it can no longer finish.
+- **Automatic resume:** `resumesWhenOnline` continues the conversions this process kept when the network returns; `engine.automaticResumes()`; `ConversionViewModel` follows them.
+- **Resume helpers:** `ConversionRecord.canResume`, `isExpired()`, `key`; `discardPendingConversions(where:)`; `ConversionEngine.maxResumableAge`.
+- **Control:** `engine.cancel(id:)` and `engine.cancelAll()` for conversions however they were started.
+- **Catalogue:** `CloudConvertCatalog` (`engine.catalog`): `/convert/formats` with options, cached on disk for `catalogMaxAge`, used when the API can't be reached; `supports`, `engines`, `options`, `outputFormats`, `options(forOperation:)`, `issues(in:)`. Known failing pairs (`ConversionPair.knownFailures`: DOC and PPT to PDF) are left out. `validatesRequests` checks every request before anything is uploaded; a pair or operation the catalogue lists without options is not judged.
+- **Multi-step jobs:** `ConversionRequest.followUps` (`ProcessingStep`): convert then optimize, each file then one archive, in one job.
+- **Setup:** `CloudConvertConfiguration.fetchingKey { … }`; default session identifier `<bundle id>.cloudconvert` and job tag `<bundle id> <version> (<platform>)`.
+- **Background activity without UIKit:** `SystemBackgroundActivity`, the default: a `ProcessInfo` activity on macOS, `performExpiringActivity` on iOS.
+- **`CloudConvertKitTesting`:** `FakeCloudConvertAPI`, `FakeFileTransfers`, `FakeConnectivity`, `AlwaysOnline`, `AlwaysOffline`.
+- **Swift 6:** strict concurrency checking on every target, and `CloudConvertKitSwift6Tests` in the Swift 6 language mode.
+- Tests: 175, on macOS, the iOS simulator and under Thread Sanitizer, grouped by subject; duplicates removed and timing-based assertions replaced by exact ones.
+
 ## 1.1.0
 
 Fixes from two independent reviews. Three additions to the public API: `CloudConvertError.isResumable`, `ConversionEngine.resumePendingConversions(where:)` and `ConversionEngine.resumedConversion(id:)`. Nothing was removed or renamed, and `CloudConvertError` has no new cases.

@@ -451,14 +451,3 @@ final class StressTests: XCTestCase {
         XCTAssertEqual(extraUploads, 0, "an upload was repeated to a form that already had its file")
     }
 }
-
-/// `nil` when `body` does not finish within `seconds`.
-func withTimeout<T: Sendable>(seconds: TimeInterval, _ body: @escaping @Sendable () async -> T) async -> T? {
-    await withTaskGroup(of: T?.self) { group in
-        group.addTask { await body() }
-        group.addTask { try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000)); return nil }
-        let first = await group.next() ?? nil
-        group.cancelAll()
-        return first
-    }
-}

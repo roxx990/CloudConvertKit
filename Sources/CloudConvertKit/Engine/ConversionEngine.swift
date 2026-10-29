@@ -30,9 +30,30 @@ public final class ConversionEngine: @unchecked Sendable {
     /// The conversions `resumePendingConversions` started, for `resumedConversion(id:)`.
     private let resumed = ResumedConversions()
 
+    /// Conversions `convert`/`run` are running, to cancel them by id.
+    private let running = RunningConversions()
+
+    /// `maxConcurrentConversions`, for every conversion the engine runs.
+    private let slots: ConversionSlots
+
+    /// Keys of keyed requests being started or followed in this process.
+    private let keysInFlight = LockedValue<Set<String>>([])
+
+    /// Conversions this process kept, for `resumesWhenOnline`.
+    private let keptHere = LockedValue<Set<String>>([])
+    private let automatic = HandleBroadcast()
+    private var watcher: Task<Void, Never>?
+
+    private let credits = LockedValue<(balance: Int, at: Date)?>(nil)
+    private let lastCreditCheck = LockedValue<Date?>(nil)
+
+    /// What CloudConvert converts, and with which options. Cached under the
+    /// working directory for `catalogMaxAge`.
+    public let catalog: CloudConvertCatalog
+
     /// Records older than this are considered unrecoverable on resume; the
     /// server purges jobs after 24 h and upload forms expire long before.
-    private let maxResumableAge: TimeInterval = 20 * 60 * 60
+    public static let maxResumableAge: TimeInterval = 20 * 60 * 60
 
     /// - Parameters:
     ///   - api: Injected in tests. Defaults to `CloudConvertAPI` over URLSession.
@@ -62,8 +83,20 @@ public final class ConversionEngine: @unchecked Sendable {
                                       logger: configuration.logger)
         }
         self.store = store ?? ConversionRecordStore(directory: storage.recordsDirectory, logger: configuration.logger)
+        self.slots = ConversionSlots(limit: configuration.maxConcurrentConversions)
+        self.catalog = CloudConvertCatalog(api: self.api,
+                                           cacheURL: configuration.workingDirectory.appendingPathComponent("catalog.json"),
+                                           maxAge: configuration.catalogMaxAge,
+                                           knownFailures: configuration.knownFailingConversions,
+                                           logger: configuration.logger)
         try? storage.prepareDirectories()
         storage.purgeStaleTemporaryFiles()
+        removeUnreadableRecords()
+        if configuration.resumesWhenOnline { watchForNetwork() }
+    }
+
+    deinit {
+        watcher?.cancel()
     }
 
     // MARK: - Public API: running conversions
@@ -74,13 +107,27 @@ public final class ConversionEngine: @unchecked Sendable {
     /// A conversion that stops because the network or the polling deadline
     /// ran out while its job may still finish throws an error that
     /// `isResumable`: it is kept, and `resumePendingConversions` continues it.
+    ///
+    /// With a `request.key`, the conversion kept for that key is continued
+    /// instead, when it can still finish; the result then carries that
+    /// conversion's id, not `conversionID`.
     public func convert(_ request: ConversionRequest,
                         conversionID: String? = nil,
                         progress: ConversionProgressHandler? = nil) async throws -> ConversionResult {
         let specification = try request.makeJobSpecification(defaultTag: configuration.jobTag,
                                                               defaultTimeout: configuration.serverTaskTimeout)
+        if configuration.validatesRequests { try await check(request) }
+        guard let key = request.key else {
+            return try await run(specification, output: request.output, userInfo: request.userInfo,
+                                 conversionID: conversionID, key: nil, progress: progress)
+        }
+        guard keysInFlight.withLock({ $0.insert(key).inserted }) else {
+            throw CloudConvertError.invalidRequest(reason: "A conversion with key \(key) is already running")
+        }
+        defer { keysInFlight.withLock { _ = $0.remove(key) } }
+        if let result = try await continueKept(key: key, progress: progress) { return result }
         return try await run(specification, output: request.output, userInfo: request.userInfo,
-                             conversionID: conversionID, progress: progress)
+                             conversionID: conversionID, key: key, progress: progress)
     }
 
     /// Runs a hand-built job (see `JobBuilder`).
@@ -89,16 +136,52 @@ public final class ConversionEngine: @unchecked Sendable {
                     userInfo: [String: String] = [:],
                     conversionID: String? = nil,
                     progress: ConversionProgressHandler? = nil) async throws -> ConversionResult {
+        try await run(specification, output: output, userInfo: userInfo, conversionID: conversionID, key: nil, progress: progress)
+    }
+
+    private func run(_ specification: JobSpecification,
+                     output: OutputOptions,
+                     userInfo: [String: String],
+                     conversionID: String?,
+                     key: String?,
+                     progress: ConversionProgressHandler?) async throws -> ConversionResult {
         let conversionID = conversionID ?? UUID().uuidString
+        // Its own task, so `cancel(id:)` and `cancelAll()` can stop it.
+        let task = Task { [self] in
+            try await runNow(specification, output: output, userInfo: userInfo, conversionID: conversionID, key: key, progress: progress)
+        }
+        running.add(conversionID, task)
+        defer { running.remove(conversionID, task) }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    private func runNow(_ specification: JobSpecification,
+                        output: OutputOptions,
+                        userInfo: [String: String],
+                        conversionID: String,
+                        key: String?,
+                        progress: ConversionProgressHandler?) async throws -> ConversionResult {
         let reporter = ProgressReporter(conversionID: conversionID, weights: configuration.progressWeights, handler: progress)
         active.insert(conversionID)
         defer { active.remove(conversionID) }
         reporter.stage(.preparing)
 
+        do {
+            try await slots.acquire()
+        } catch {
+            reporter.stage(.cancelled)
+            throw CloudConvertError.cancelled
+        }
+        defer { slots.release() }
+
         // Everything before the record exists fails locally and cheaply.
         let record: ConversionRecord
         do {
-            record = try await prepare(specification, output: output, userInfo: userInfo, conversionID: conversionID)
+            record = try await prepare(specification, output: output, userInfo: userInfo, key: key, conversionID: conversionID)
         } catch {
             let ccError = CloudConvertError.wrap(error, phase: .preparing)
             reporter.stage(ccError.isCancellation ? .cancelled : .failed)
@@ -107,6 +190,79 @@ public final class ConversionEngine: @unchecked Sendable {
             throw ccError
         }
         return try await execute(record, reporter: reporter)
+    }
+
+    /// The conversion kept for `key`, continued to its end; nil when there
+    /// is none that can still finish (each such record is discarded).
+    private func continueKept(key: String, progress: ConversionProgressHandler?) async throws -> ConversionResult? {
+        let records = await store.all().filter { $0.key == key }.sorted { $0.updatedAt > $1.updatedAt }
+        // Being continued in this process (by the app, or when the network came back).
+        let activeIDs = active.snapshot
+        if let handle = records.lazy.filter({ activeIDs.contains($0.id) }).compactMap({ self.resumed.handle($0.id) }).first {
+            return try await follow(handle, progress: progress)
+        }
+        let pending = records.filter { !activeIDs.contains($0.id) }
+        let newest = pending.first { $0.canResume }
+        for record in pending where record.id != newest?.id {
+            await discardPendingConversion(id: record.id)
+        }
+        guard let newest, let handle = await resumePendingConversions(where: { $0.id == newest.id }).first else { return nil }
+        do {
+            return try await follow(handle, progress: progress)
+        } catch let error as CloudConvertError {
+            // Gone meanwhile: its job purged, or its staged copy. Start over.
+            switch error {
+            case .jobLost, .fileNotFound:
+                logger.notice("Conversion \(newest.id) for key \(key) can't continue (\(error.analyticsCode)); starting over")
+                return nil
+            default:
+                throw error
+            }
+        }
+    }
+
+    /// Awaits `handle`, forwarding its progress; cancelling stops it.
+    private func follow(_ handle: ConversionHandle, progress: ConversionProgressHandler?) async throws -> ConversionResult {
+        let observer = Task {
+            for await update in handle.progress { progress?(update) }
+        }
+        defer { observer.cancel() }
+        return try await withTaskCancellationHandler {
+            try await handle.result
+        } onCancel: {
+            handle.cancel()
+        }
+    }
+
+    /// Throws `.invalidRequest` for what the catalogue says will fail.
+    /// A catalogue that can't be loaded checks nothing.
+    private func check(_ request: ConversionRequest) async throws {
+        let issues: [CatalogIssue]
+        do {
+            issues = try await catalog.issues(in: request)
+        } catch {
+            logger.notice("Request not checked: the catalogue is unavailable (\(CloudConvertError.wrap(error, phase: .preparing).analyticsCode))")
+            return
+        }
+        guard issues.isEmpty else {
+            throw CloudConvertError.invalidRequest(reason: issues.map(\.description).joined(separator: "; "))
+        }
+    }
+
+    // MARK: - Public API: control
+
+    /// Cancels the conversion `id` running in this process: one `convert`,
+    /// `run` or `start` started, or `resumePendingConversions` continued.
+    public func cancel(id: String) {
+        running.cancel(id)
+        resumed.handle(id)?.cancel()
+    }
+
+    /// Cancels every conversion running in this process. Their jobs are
+    /// deleted, as with any cancellation; nothing is kept.
+    public func cancelAll() {
+        running.cancelAll()
+        resumed.cancelAll()
     }
 
     /// Starts a conversion and returns immediately with a handle that exposes
@@ -181,6 +337,15 @@ public final class ConversionEngine: @unchecked Sendable {
             handles.append(resumed.start(record.id) { [self] progress in
                 defer { active.remove(record.id) }
                 let reporter = ProgressReporter(conversionID: record.id, weights: configuration.progressWeights) { progress.yield($0) }
+                reporter.stage(.preparing, jobAttempt: record.jobAttempt, jobID: record.jobID)
+                do {
+                    try await slots.acquire()
+                } catch {
+                    // Cancelled before it could continue: given up, like any cancellation.
+                    await abandon(record, reporter: reporter, stage: .cancelled)
+                    throw CloudConvertError.cancelled
+                }
+                defer { slots.release() }
                 return try await resume(record, reporter: reporter)
             })
         }
@@ -221,6 +386,32 @@ public final class ConversionEngine: @unchecked Sendable {
         await store.delete(id: id)
     }
 
+    /// Forgets every pending conversion `isIncluded` accepts (see
+    /// `discardPendingConversion(id:)`); running ones are left alone.
+    public func discardPendingConversions(where isIncluded: @Sendable (ConversionRecord) -> Bool) async {
+        for record in await pendingConversions() where isIncluded(record) {
+            await discardPendingConversion(id: record.id)
+        }
+    }
+
+    /// The conversions continued because the network came back
+    /// (`resumesWhenOnline`), as they start. Each stream gets those started
+    /// after it was made.
+    public func automaticResumes() -> AsyncStream<ConversionHandle> {
+        automatic.makeStream()
+    }
+
+    // MARK: - Public API: account
+
+    /// The account's remaining credits (`GET /users/me`, which needs the
+    /// `user.read` scope), reused for `maxAge` seconds.
+    public func creditBalance(maxAge: TimeInterval = 300) async throws -> Int? {
+        if let cached = credits.get(), Date().timeIntervalSince(cached.at) < maxAge { return cached.balance }
+        guard let balance = try await api.currentUser().credits else { return nil }
+        credits.set((balance, Date()))
+        return balance
+    }
+
     // MARK: - Public API: catalogue
 
     /// Queries the operations catalogue, e.g. to validate a format pair before
@@ -238,6 +429,7 @@ public final class ConversionEngine: @unchecked Sendable {
     private func prepare(_ specification: JobSpecification,
                          output: OutputOptions,
                          userInfo: [String: String],
+                         key: String?,
                          conversionID: String) async throws -> ConversionRecord {
         try specification.validate()
         try storage.prepareDirectories()
@@ -269,7 +461,10 @@ public final class ConversionEngine: @unchecked Sendable {
                                       uploadTransfers: [:],
                                       uploadedTaskNames: [],
                                       downloadTransfers: [:],
-                                      exportedFiles: [])
+                                      exportedFiles: [],
+                                      key: key,
+                                      credits: nil,
+                                      formatVersion: ConversionRecord.currentFormatVersion)
         await store.save(record)
         return record
     }
@@ -288,7 +483,7 @@ public final class ConversionEngine: @unchecked Sendable {
     private func resume(_ record: ConversionRecord, reporter: ProgressReporter) async throws -> ConversionResult {
         reporter.stage(.preparing, jobAttempt: record.jobAttempt, jobID: record.jobID)
         do {
-            guard Date().timeIntervalSince(record.createdAt) < maxResumableAge else {
+            guard !record.isExpired() else {
                 throw CloudConvertError.jobLost(jobID: record.jobID ?? "none")
             }
             for staged in record.staged.values where !FileManager.default.fileExists(atPath: staged.stagedURL.path) {
@@ -320,6 +515,7 @@ public final class ConversionEngine: @unchecked Sendable {
                 let result = try await runJob(&record, reporter: reporter, startedAt: startedAt)
                 reporter.stage(.completed, jobID: record.jobID)
                 await finishLocally(record)
+                checkCreditsIfNeeded()
                 return result
             } catch {
                 let ccError = CloudConvertError.wrap(error, phase: record.phase)
@@ -441,9 +637,11 @@ public final class ConversionEngine: @unchecked Sendable {
         }
         guard keepsRecord(after: error, record: record) else {
             await abandon(record, reporter: reporter, stage: .failed)
+            if error.isAccountProblem { reportAccountProblem(error) }
             return error
         }
         await store.save(record)
+        if configuration.resumesWhenOnline { keptHere.withLock { _ = $0.insert(record.id) } }
         reporter.stage(.failed, jobID: record.jobID)
         logger.notice("Conversion \(record.id): stopped (\(error.analyticsCode)); kept with job \(record.jobID ?? "-") to resume")
         if case .jobTimedOut = error { return error }
@@ -496,11 +694,10 @@ public final class ConversionEngine: @unchecked Sendable {
         reporter.stage(.finishing, jobID: record.jobID)
         if let jobID = record.jobID { deleteRemoteJobDetached(jobID) }
 
-        let credits = finishedJob?.tasks.compactMap(\.credits) ?? []
         return ConversionResult(conversionID: record.id,
                                 jobID: record.jobID ?? finishedJob?.id ?? "",
                                 files: files,
-                                credits: credits.isEmpty ? nil : credits.saturatingSum(),
+                                credits: record.credits,
                                 duration: Date().timeIntervalSince(startedAt),
                                 userInfo: record.userInfo)
     }
@@ -622,8 +819,10 @@ public final class ConversionEngine: @unchecked Sendable {
         let reattached = record.uploadTransfers[taskName] != nil
         if let existingID = record.uploadTransfers[taskName] {
             do {
-                let outcome = try await transfers.awaitExistingTransfer(id: existingID) { [reporter] in
-                    reporter.upload(taskName: taskName, progress: $0)
+                let outcome = try await reportingOffline(reporter, restoreTo: .uploading, jobID: record.jobID) {
+                    try await transfers.awaitExistingTransfer(id: existingID) { [reporter] in
+                        reporter.upload(taskName: taskName, progress: $0)
+                    }
                 }
                 if outcome.status != nil {
                     try validateUpload(outcome)
@@ -715,8 +914,10 @@ public final class ConversionEngine: @unchecked Sendable {
             recordBox.update { $0.uploadTransfers[taskName] = transferID }
             await store.save(recordBox.value)
 
-            let outcome = try await transfers.upload(id: transferID, request: request, bodyFile: body.fileURL) { [reporter] in
-                reporter.upload(taskName: taskName, progress: $0)
+            let outcome = try await self.reportingOffline(reporter, restoreTo: .uploading, jobID: jobID) {
+                try await transfers.upload(id: transferID, request: request, bodyFile: body.fileURL) { [reporter] in
+                    reporter.upload(taskName: taskName, progress: $0)
+                }
             }
             transfers.forget(id: transferID)
             try self.validateUpload(outcome)
@@ -785,6 +986,8 @@ public final class ConversionEngine: @unchecked Sendable {
                   let files = export.result?.files, !files.isEmpty else {
                 throw CloudConvertError.exportMissing(jobID: jobID)
             }
+            let credits = job.tasks.compactMap(\.credits)
+            record.credits = credits.isEmpty ? nil : credits.saturatingSum()
             // Keep `finalURL` for files a previous launch already saved.
             let previous = record.exportedFiles
             record.exportedFiles = files.enumerated().map { index, file in
@@ -855,8 +1058,10 @@ public final class ConversionEngine: @unchecked Sendable {
         var reattachFailure: Error?
         if let existingID = record.downloadTransfers[index] {
             do {
-                let outcome = try await transfers.awaitExistingTransfer(id: existingID) { [reporter] in
-                    reporter.download(index: index, progress: $0)
+                let outcome = try await reportingOffline(reporter, restoreTo: .downloading, jobID: record.jobID) {
+                    try await transfers.awaitExistingTransfer(id: existingID) { [reporter] in
+                        reporter.download(index: index, progress: $0)
+                    }
                 }
                 // Failed without a response while the app was not running: download again.
                 if outcome.status != nil, let url = try validateDownload(outcome, exported: exported) {
@@ -900,8 +1105,10 @@ public final class ConversionEngine: @unchecked Sendable {
             recordBox.update { $0.downloadTransfers[index] = transferID }
             await store.save(recordBox.value)
 
-            let outcome = try await transfers.download(id: transferID, request: request, destination: destination) { [reporter] in
-                reporter.download(index: index, progress: $0)
+            let outcome = try await self.reportingOffline(reporter, restoreTo: .downloading, jobID: jobID) {
+                try await transfers.download(id: transferID, request: request, destination: destination) { [reporter] in
+                    reporter.download(index: index, progress: $0)
+                }
             }
             transfers.forget(id: transferID)
             guard let url = try self.validateDownload(outcome, exported: exported) else {
@@ -976,13 +1183,106 @@ public final class ConversionEngine: @unchecked Sendable {
         }
     }
 
+    /// Runs a transfer, reporting `.waitingForNetwork` while the network is
+    /// away: the transfer session waits for it by itself, without failing,
+    /// so nothing else would tell the user why the bar stopped.
+    private func reportingOffline<T>(_ reporter: ProgressReporter,
+                                     restoreTo stage: ConversionProgress.Stage,
+                                     jobID: String?,
+                                     _ transfer: () async throws -> T) async throws -> T {
+        let connectivity = self.connectivity
+        let watcher = Task {
+            var offline = false
+            for await connected in connectivity.changes() {
+                if !connected, !offline {
+                    offline = true
+                    reporter.stage(.waitingForNetwork, jobID: jobID)
+                } else if connected, offline {
+                    offline = false
+                    reporter.stage(stage, jobID: jobID)
+                }
+            }
+        }
+        defer { watcher.cancel() }
+        return try await transfer()
+    }
+
     private func waitForNetworkIfNeeded(reporter: ProgressReporter, restoreTo stage: ConversionProgress.Stage) async throws {
         let connected = await connectivity.isConnected
         guard !connected else { return }
         try await makeNetworkWaiter(reporter: reporter, restoreTo: stage)()
     }
 
+    // MARK: - Account
+
+    private func reportAccountProblem(_ error: CloudConvertError) {
+        guard let observer = configuration.accountObserver else { return }
+        Task.detached(priority: .utility) { observer.conversionStopped(byAccountProblem: error) }
+    }
+
+    /// After a conversion, at most every ten minutes: tell the observer when
+    /// the balance is below `lowCreditThreshold`.
+    private func checkCreditsIfNeeded() {
+        guard let observer = configuration.accountObserver, let threshold = configuration.lowCreditThreshold else { return }
+        let due = lastCreditCheck.withLock { last -> Bool in
+            if let last, Date().timeIntervalSince(last) < 10 * 60 { return false }
+            last = Date()
+            return true
+        }
+        guard due else { return }
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            do {
+                if let balance = try await self.creditBalance(maxAge: 0), balance < threshold {
+                    observer.creditsRunningLow(remaining: balance)
+                }
+            } catch {
+                self.logger.debug("Credit balance unavailable: \(CloudConvertError.wrap(error, phase: .finishing).analyticsCode)")
+            }
+        }
+    }
+
+    // MARK: - Automatic resume
+
+    private func watchForNetwork() {
+        let changes = connectivity.changes()
+        watcher = Task.detached(priority: .utility) { [weak self] in
+            for await connected in changes where connected {
+                guard let self else { return }
+                await self.resumeKeptHere()
+            }
+        }
+    }
+
+    private func resumeKeptHere() async {
+        let ids = keptHere.withLock { kept -> Set<String> in
+            defer { kept.removeAll() }
+            return kept
+        }
+        guard !ids.isEmpty else { return }
+        for handle in await resumePendingConversions(where: { ids.contains($0.id) }) {
+            logger.notice("Conversion \(handle.id): back online; continuing")
+            automatic.yield(handle)
+        }
+    }
+
     // MARK: - Cleanup
+
+    /// Records a release can't read are removed, with their jobs and files:
+    /// kept, they would never be resumed nor cleaned up.
+    private func removeUnreadableRecords() {
+        let store = self.store, storage = self.storage, api = self.api, logger = self.logger
+        Task.detached(priority: .utility) {
+            for record in await store.removeUnreadableRecords() {
+                storage.cleanup(conversionID: record.id)
+                if let jobID = record.jobID {
+                    do { try await api.deleteJob(id: jobID) } catch {
+                        logger.debug("Could not delete job \(jobID) of an unreadable record")
+                    }
+                }
+            }
+        }
+    }
 
     private func abortTransfers(_ record: ConversionRecord) {
         for id in record.uploadTransfers.values { transfers.cancel(id: id); transfers.forget(id: id) }
@@ -1113,6 +1413,108 @@ private final class ResumedConversions: @unchecked Sendable {
     func remove(_ id: String, token: UUID? = nil) {
         lock.lock(); defer { lock.unlock() }
         if token == nil || entries[id]?.token == token { entries[id] = nil }
+    }
+
+    func cancelAll() {
+        lock.lock()
+        let tasks = entries.values.map(\.task)
+        lock.unlock()
+        tasks.forEach { $0.cancel() }
+    }
+}
+
+/// The tasks `run` started, by conversion id.
+private final class RunningConversions: @unchecked Sendable {
+    private let lock = NSLock()
+    private var tasks: [String: Task<ConversionResult, Error>] = [:]
+
+    func add(_ id: String, _ task: Task<ConversionResult, Error>) {
+        lock.lock(); tasks[id] = task; lock.unlock()
+    }
+
+    func remove(_ id: String, _ task: Task<ConversionResult, Error>) {
+        lock.lock(); if tasks[id] == task { tasks[id] = nil }; lock.unlock()
+    }
+
+    func cancel(_ id: String) {
+        lock.lock(); let task = tasks[id]; lock.unlock()
+        task?.cancel()
+    }
+
+    func cancelAll() {
+        lock.lock(); let all = Array(tasks.values); lock.unlock()
+        all.forEach { $0.cancel() }
+    }
+}
+
+/// At most `limit` conversions at once; the others wait their turn, in order.
+final class ConversionSlots: @unchecked Sendable {
+    private let lock = NSLock()
+    private let limit: Int
+    private var used = 0
+    private var waiters: [(id: UUID, continuation: CheckedContinuation<Void, Error>)] = []
+
+    init(limit: Int) { self.limit = max(1, limit) }
+
+    /// Throws `.cancelled` when the task is cancelled while waiting.
+    func acquire() async throws {
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                lock.lock()
+                if Task.isCancelled {
+                    lock.unlock()
+                    continuation.resume(throwing: CloudConvertError.cancelled)
+                } else if used < limit {
+                    used += 1
+                    lock.unlock()
+                    continuation.resume()
+                } else {
+                    waiters.append((id, continuation))
+                    lock.unlock()
+                }
+            }
+        } onCancel: {
+            lock.lock()
+            let waiter = waiters.firstIndex { $0.id == id }.map { waiters.remove(at: $0) }
+            lock.unlock()
+            waiter?.continuation.resume(throwing: CloudConvertError.cancelled)
+        }
+    }
+
+    /// Hands the slot to the next waiter, or frees it.
+    func release() {
+        lock.lock()
+        if waiters.isEmpty {
+            used = max(0, used - 1)
+            lock.unlock()
+        } else {
+            let next = waiters.removeFirst()
+            lock.unlock()
+            next.continuation.resume()
+        }
+    }
+}
+
+/// Handles for every stream made by `automaticResumes()`.
+private final class HandleBroadcast: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuations: [UUID: AsyncStream<ConversionHandle>.Continuation] = [:]
+
+    func makeStream() -> AsyncStream<ConversionHandle> {
+        AsyncStream { continuation in
+            let id = UUID()
+            lock.lock(); continuations[id] = continuation; lock.unlock()
+            continuation.onTermination = { [weak self] _ in
+                guard let self else { return }
+                self.lock.lock(); self.continuations[id] = nil; self.lock.unlock()
+            }
+        }
+    }
+
+    func yield(_ handle: ConversionHandle) {
+        lock.lock(); let all = Array(continuations.values); lock.unlock()
+        all.forEach { $0.yield(handle) }
     }
 }
 

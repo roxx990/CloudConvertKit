@@ -8,8 +8,8 @@
 //      func application(_ application: UIApplication,
 //                       handleEventsForBackgroundURLSession identifier: String,
 //                       completionHandler: @escaping () -> Void) {
-//          BackgroundTransferManager.shared(for: identifier)?
-//              .setBackgroundCompletionHandler(completionHandler)
+//          BackgroundTransferManager.handleEventsForBackgroundURLSession(
+//              identifier: identifier, completionHandler: completionHandler)
 //      }
 //
 
@@ -100,6 +100,11 @@ public final class BackgroundTransferManager: NSObject, FileTransferring, @unche
             lock.lock(); defer { lock.unlock() }
             return managers[identifier] ?? make()
         }
+
+        func withLock<T>(_ body: (inout [String: BackgroundTransferManager]) -> T) -> T {
+            lock.lock(); defer { lock.unlock() }
+            return body(&managers)
+        }
     }
 
     private static let registry = Registry()
@@ -148,7 +153,12 @@ public final class BackgroundTransferManager: NSObject, FileTransferring, @unche
     /// from the system (iOS cancels background transfers when the user
     /// force-quits the app): the transfer is lost, the user cancelled nothing.
     private var cancelRequested: Set<String> = []
-    private var backgroundCompletionHandler: (@Sendable () -> Void)?
+    private var backgroundCompletionHandler: CompletionHandler?
+    /// When the session delivered all its background events while no
+    /// completion handler was stored (the delegate can run before the app
+    /// hands the handler over). A handler that arrives soon after is called
+    /// at once instead of never.
+    private var eventsFinishedWithoutHandler: Date?
     private var reattached = false
 
     /// Created in `init`, before the manager can be found through
@@ -199,13 +209,60 @@ public final class BackgroundTransferManager: NSObject, FileTransferring, @unche
         // two threads initialising the lazy property would open two sessions.
         _ = session
         Self.registry[identifier] = self
+        if let pending = Self.pendingHandlers.withLock({ $0.removeValue(forKey: identifier) }) {
+            store(pending)
+        }
         reattachToRunningTasks()
     }
 
+    /// The one call `application(_:handleEventsForBackgroundURLSession:completionHandler:)`
+    /// needs. The handler goes to the manager for `identifier`, or, when the
+    /// app has not created it yet, waits for it: nothing is dropped. Create
+    /// the engine (or whatever owns it) soon after, so the session reconnects
+    /// and its events are delivered.
+    public static func handleEventsForBackgroundURLSession(identifier: String,
+                                                           completionHandler: @escaping () -> Void) {
+        let handler = CompletionHandler(completionHandler)
+        let manager: BackgroundTransferManager? = registry.withLock { managers in
+            if let manager = managers[identifier] { return manager }
+            pendingHandlers.withLock { $0[identifier] = handler }
+            return nil
+        }
+        manager?.store(handler)
+    }
+
     /// Store the system's completion handler; it is invoked once all
-    /// background events for this session have been delivered.
-    public func setBackgroundCompletionHandler(_ handler: @escaping @Sendable () -> Void) {
-        locked { backgroundCompletionHandler = handler }
+    /// background events for this session have been delivered (at once, if
+    /// they were delivered just before it arrived).
+    public func setBackgroundCompletionHandler(_ handler: @escaping () -> Void) {
+        store(CompletionHandler(handler))
+    }
+
+    private func store(_ handler: CompletionHandler) {
+        let callNow: Bool = locked {
+            if let finished = eventsFinishedWithoutHandler, Date().timeIntervalSince(finished) < Self.lateHandlerWindow {
+                eventsFinishedWithoutHandler = nil
+                return true
+            }
+            eventsFinishedWithoutHandler = nil
+            backgroundCompletionHandler = handler
+            return false
+        }
+        if callNow { DispatchQueue.main.async { handler.call() } }
+    }
+
+    /// How long after the events finished a late handler is still theirs.
+    static let lateHandlerWindow: TimeInterval = 30
+
+    /// Handlers that arrived before their manager was created.
+    private static let pendingHandlers = LockedValue<[String: CompletionHandler]>([:])
+
+    /// UIKit's handler is not `@Sendable`; it is only ever called once, on
+    /// the main queue.
+    final class CompletionHandler: @unchecked Sendable {
+        private let body: () -> Void
+        init(_ body: @escaping () -> Void) { self.body = body }
+        func call() { body() }
     }
 
     // MARK: FileTransferring
@@ -452,13 +509,14 @@ public final class BackgroundTransferManager: NSObject, FileTransferring, @unche
 extension BackgroundTransferManager: URLSessionDelegate, URLSessionTaskDelegate, URLSessionDataDelegate, URLSessionDownloadDelegate {
 
     public func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
-        let handler: (@Sendable () -> Void)? = locked {
+        let handler: CompletionHandler? = locked {
             let handler = backgroundCompletionHandler
             backgroundCompletionHandler = nil
+            if handler == nil { eventsFinishedWithoutHandler = Date() }
             return handler
         }
         if let handler {
-            DispatchQueue.main.async { handler() }
+            DispatchQueue.main.async { handler.call() }
         }
     }
 
