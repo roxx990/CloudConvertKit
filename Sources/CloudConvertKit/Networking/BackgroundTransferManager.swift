@@ -3,7 +3,7 @@
 //  every transfer is recorded on disk with its destination, and outcomes are
 //  persisted when the delegate fires so a relaunched app can pick them up.
 //
-//  Wire-up in the app (see README):
+//  Wire-up in the app (see Docs/App-Lifecycle.md):
 //
 //      func application(_ application: UIApplication,
 //                       handleEventsForBackgroundURLSession identifier: String,

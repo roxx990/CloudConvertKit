@@ -28,17 +28,28 @@ final class RetryPolicyTests: XCTestCase {
         }
     }
 
+    /// A `Retry-After` the server or a proxy sends never traps or waits forever.
+    func testRetryAfterIsFiniteAndBounded() {
+        for raw in ["inf", "-inf", "nan", "1e30", "99999999999999999999"] {
+            let delay = HTTPResponse(status: 429, headers: ["Retry-After": raw], body: Data()).retryAfter
+            XCTAssertTrue(delay.map { $0.isFinite && $0 >= 0 && $0 <= HTTPResponse.maxRetryAfter } ?? true, raw)
+        }
+        let farFuture = HTTPResponse(status: 429, headers: ["Retry-After": "Fri, 31 Dec 9999 23:59:59 GMT"], body: Data())
+        XCTAssertEqual(farFuture.retryAfter, HTTPResponse.maxRetryAfter)
+        XCTAssertEqual(HTTPResponse(status: 429, headers: ["Retry-After": "7"], body: Data()).retryAfter, 7)
+    }
+
     func testRetryingStopsOnNonRetryableError() async {
         let counter = Counter()
         do {
             let _: Int = try await retrying(policy: .api, phase: .creatingJob, logger: SilentCloudConvertLogger(), label: "t",
                                             operation: { () async throws -> Int in
-                counter.increment()
+                counter.next()
                 throw CloudConvertError.validation(nil)
             })
             XCTFail("expected throw")
         } catch {
-            XCTAssertEqual(counter.value, 1)
+            XCTAssertEqual(counter.count, 1)
         }
     }
 
@@ -48,11 +59,11 @@ final class RetryPolicyTests: XCTestCase {
         let policy = RetryPolicy(maxAttempts: 3, baseDelay: 0.01, maxDelay: 0.01, jitter: 0)
         let value: Int = try await retrying(policy: policy, phase: .creatingJob, logger: SilentCloudConvertLogger(), label: "t",
                                             operation: { () async throws -> Int in
-            if counter.increment() == 1 { throw CloudConvertError.rateLimited(retryAfter: 0.5) }
+            if counter.next() == 1 { throw CloudConvertError.rateLimited(retryAfter: 0.5) }
             return 42
         })
         XCTAssertEqual(value, 42)
-        XCTAssertEqual(counter.value, 2)
+        XCTAssertEqual(counter.count, 2)
         XCTAssertGreaterThan(Date().timeIntervalSince(started), 0.45, "Retry-After must be honoured")
     }
 
@@ -61,20 +72,13 @@ final class RetryPolicyTests: XCTestCase {
         let waits = Counter()
         let policy = RetryPolicy(maxAttempts: 1, baseDelay: 0, maxDelay: 0)
         let value: String = try await retrying(policy: policy, phase: .uploading, logger: SilentCloudConvertLogger(), label: "t",
-                                               waitForNetwork: { _ = waits.increment() },
+                                               waitForNetwork: { _ = waits.next() },
                                                operation: { () async throws -> String in
-            if counter.increment() < 3 { throw CloudConvertError.notConnected }
+            if counter.next() < 3 { throw CloudConvertError.notConnected }
             return "ok"
         })
         XCTAssertEqual(value, "ok")
-        XCTAssertEqual(waits.value, 2)
-    }
-
-    final class Counter: @unchecked Sendable {
-        private let lock = NSLock()
-        private var count = 0
-        var value: Int { lock.lock(); defer { lock.unlock() }; return count }
-        @discardableResult func increment() -> Int { lock.lock(); defer { lock.unlock() }; count += 1; return count }
+        XCTAssertEqual(waits.count, 2)
     }
 }
 
@@ -82,19 +86,12 @@ final class RetryPolicyTests: XCTestCase {
 
 final class AuthorizationTests: XCTestCase {
 
-    private final class Counter: @unchecked Sendable {
-        private let lock = NSLock()
-        private var value = 0
-        func increment() -> Int { lock.lock(); defer { lock.unlock() }; value += 1; return value }
-        var count: Int { lock.lock(); defer { lock.unlock() }; return value }
-    }
-
     private struct StoreDown: Error {}
 
     func testRequestsThatNeedTheKeyTogetherShareOneFetch() async throws {
         let fetches = Counter()
         let authorization = RefreshableTokenAuthorization {
-            _ = fetches.increment()
+            _ = fetches.next()
             try await Task.sleep(nanoseconds: 50_000_000)
             return "key"
         }
@@ -107,7 +104,7 @@ final class AuthorizationTests: XCTestCase {
 
     func testA401WithAReplacedKeyDoesNotFetchAgain() async throws {
         let fetches = Counter()
-        let authorization = RefreshableTokenAuthorization { "key-\(fetches.increment())" }
+        let authorization = RefreshableTokenAuthorization { "key-\(fetches.next())" }
         _ = try await authorization.authorizationHeaderValue()
         // Refused with the current key: fetch a new one.
         let retryWithNewKey = await authorization.handleUnauthorized(rejected: "Bearer key-1")
@@ -125,7 +122,7 @@ final class AuthorizationTests: XCTestCase {
     func testAFailedFetchIsReportedAgainWithoutFetchingDuringTheCooldown() async {
         let fetches = Counter()
         let authorization = RefreshableTokenAuthorization(failureCooldown: 60) {
-            _ = fetches.increment()
+            _ = fetches.next()
             throw StoreDown()
         }
         for _ in 0..<3 { _ = try? await authorization.authorizationHeaderValue() }
@@ -136,7 +133,7 @@ final class AuthorizationTests: XCTestCase {
         let fetches = Counter()
         var configuration = CloudConvertConfiguration.testing()
         configuration.authorizationProvider = RefreshableTokenAuthorization(failureCooldown: 0) {
-            _ = fetches.increment()
+            _ = fetches.next()
             throw StoreDown()
         }
         let transport = StubTransport()
@@ -157,7 +154,7 @@ final class AuthorizationTests: XCTestCase {
     func testA401FetchesTheKeyAgainAndRetriesOnce() async throws {
         let fetches = Counter()
         var configuration = CloudConvertConfiguration.testing()
-        configuration.authorizationProvider = RefreshableTokenAuthorization { "key-\(fetches.increment())" }
+        configuration.authorizationProvider = RefreshableTokenAuthorization { "key-\(fetches.next())" }
         let transport = ScriptedTransport()
         transport.jobBody = try Fixtures.data("job-finished")
         transport.unauthorizedGets = 1

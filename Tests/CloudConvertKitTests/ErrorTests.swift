@@ -12,9 +12,13 @@ final class ErrorClassificationTests: XCTestCase {
     func testTaskFailureCodes() {
         XCTAssertEqual(TaskFailureCode(rawCode: "INVALID_CONVERSION_TYPE"), .invalidConversionType)
         XCTAssertEqual(TaskFailureCode(rawCode: "input_task_failed"), .inputTaskFailed)
+        XCTAssertEqual(TaskFailureCode(rawCode: "EXPORT_FAILED"), .exportFailed)
+        XCTAssertEqual(TaskFailureCode(rawCode: "UNKNOWN_ERROR"), .unknownError)
         XCTAssertEqual(TaskFailureCode(rawCode: "SOMETHING_NEW"), .other("SOMETHING_NEW"))
-        XCTAssertFalse(TaskFailureCode.invalidConversionType.isRetryable)
         XCTAssertTrue(TaskFailureCode.timeout.isRetryable)
+        for code: TaskFailureCode in [.invalidConversionType, .conversionFailed, .exportFailed, .unknownError, .other("SOMETHING_NEW")] {
+            XCTAssertFalse(code.isRetryable, "\(code) would rebuild, and bill, the job again")
+        }
     }
 
     func testURLErrorMapping() {
@@ -47,9 +51,30 @@ final class ErrorClassificationTests: XCTestCase {
         XCTAssertFalse(HTTPErrorMapper.error(for: HTTPResponse(status: 401, headers: [:], body: Data())).isRetryable)
     }
 
-    func testUserMessagesNeverLeakURLs() {
-        let error = CloudConvertError.downloadFailed(url: URL(string: "https://storage.cloudconvert.com/secret")!, status: 500, description: nil)
-        XCTAssertFalse(error.userFacingMessage.contains("cloudconvert.com"))
+    /// What copying onto a full disk throws, from Foundation or from a POSIX
+    /// call. Staging reports both as `.insufficientDiskSpace`, not as a file
+    /// that cannot be read.
+    func testAFullDiskIsInsufficientSpace() {
+        for error: Error in [NSError(domain: NSCocoaErrorDomain, code: NSFileWriteOutOfSpaceError), POSIXError(.ENOSPC)] {
+            guard case .insufficientDiskSpace = CloudConvertError.wrap(error, phase: .preparing) else {
+                return XCTFail("not insufficientDiskSpace: \(error)")
+            }
+        }
+    }
+
+    /// Only the two errors a kept conversion ends with are resumable.
+    func testOnlyTheErrorsOfAKeptConversionAreResumable() {
+        let offline = CloudConvertError.timedOut(phase: .waitingForNetwork)
+        XCTAssertTrue(offline.isResumable)
+        XCTAssertTrue(offline.isConnectivityRelated)
+        XCTAssertFalse(offline.isRetryable)
+        XCTAssertTrue(CloudConvertError.jobTimedOut(jobID: "j").isResumable)
+        for error: CloudConvertError in [.notConnected, .timedOut(phase: .processing), .network(code: .networkConnectionLost, description: ""),
+                                         .jobLost(jobID: "j"), .cancelled] {
+            XCTAssertFalse(error.isResumable, "\(error)")
+        }
+        XCTAssertTrue(CloudConvertError.timedOut(phase: .processing).isRetryable)
+        XCTAssertFalse(CloudConvertError.timedOut(phase: .processing).isConnectivityRelated)
     }
 }
 
@@ -72,6 +97,7 @@ final class ErrorPresentationTests: XCTestCase {
     func testFileUnsupportedAndPausedFailuresAreToldApart() {
         XCTAssertEqual(CloudConvertError.jobFailed(jobID: "j", taskName: nil, code: .openFailed, message: nil).category, .input)
         XCTAssertEqual(CloudConvertError.jobFailed(jobID: "j", taskName: nil, code: .invalidConversionType, message: nil).category, .unsupported)
+        XCTAssertEqual(CloudConvertError.jobFailed(jobID: "j", taskName: nil, code: .exportFailed, message: nil).category, .unsupported)
         XCTAssertEqual(CloudConvertError.timedOut(phase: .waitingForNetwork).category, .paused)
         XCTAssertEqual(CloudConvertError.jobTimedOut(jobID: "j").category, .paused)
         XCTAssertEqual(CloudConvertError.notConnected.category, .connectivity)
@@ -79,14 +105,34 @@ final class ErrorPresentationTests: XCTestCase {
         XCTAssertEqual(CloudConvertError.insufficientDiskSpace(required: 1, available: 0).category, .device)
     }
 
-    func testExportFailedAndUnknownErrorAreMapped() {
-        XCTAssertEqual(TaskFailureCode(rawCode: "EXPORT_FAILED"), .exportFailed)
-        XCTAssertEqual(TaskFailureCode(rawCode: "UNKNOWN_ERROR"), .unknownError)
-        XCTAssertFalse(TaskFailureCode.exportFailed.isRetryable)
-        let error = CloudConvertError.jobFailed(jobID: "j", taskName: nil, code: .exportFailed, message: nil)
-        XCTAssertEqual(error.category, .unsupported)
-        XCTAssertEqual(error.analyticsCode, "job_failed_exportFailed")
+    func testAnalyticsCodesNameTheCase() {
+        XCTAssertEqual(CloudConvertError.jobFailed(jobID: "j", taskName: nil, code: .exportFailed, message: nil).analyticsCode,
+                       "job_failed_exportFailed")
     }
+
+    func testUserMessagesNeverLeakURLs() {
+        let error = CloudConvertError.downloadFailed(url: URL(string: "https://storage.cloudconvert.com/secret")!, status: 500, description: nil)
+        XCTAssertFalse(error.userFacingMessage.contains("cloudconvert.com"))
+    }
+
+    func testInvalidRequestKeepsDeveloperTextOutOfTheMessage() {
+        let error = CloudConvertError.invalidRequest(reason: "Task 'x' references unknown input 'y'.")
+        XCTAssertFalse(error.userFacingMessage.contains("unknown input"))
+    }
+
+    func testConversionFailedMessageIsReadable() {
+        let error = CloudConvertError.jobFailed(jobID: "j", taskName: "convert", code: .conversionFailed, message: "Conversion failed")
+        XCTAssertFalse(error.userFacingMessage.contains("Conversion failed: Conversion failed"))
+        XCTAssertFalse(error.isRetryable)
+        XCTAssertFalse(error.requiresNewJob)
+    }
+
+    func testPausedConversionsSuggestTryingAgain() {
+        XCTAssertNotNil(CloudConvertError.jobTimedOut(jobID: "j").recoverySuggestion)
+        XCTAssertNil(CloudConvertError.emptyFile(URL(fileURLWithPath: "/a")).recoverySuggestion)
+    }
+
+    // MARK: Localization
 
     func testMessagesGoThroughTheLocalizationProvider() {
         CloudConvertLocalization.setProvider { key, english in key == "cloudconvert.error.notConnected" ? "Hors ligne" : english }
@@ -107,15 +153,5 @@ final class ErrorPresentationTests: XCTestCase {
         CloudConvertLocalization.setProvider { key, english in key == "cloudconvert.stage.retrying" ? "Nouvel essai (%d)" : english }
         let progress = ConversionProgress(conversionID: "c", stage: .retrying(attempt: 2, delay: 1, scope: .job, reason: "x"), fractionCompleted: 0)
         XCTAssertEqual(progress.localizedStageDescription, "Nouvel essai (2)")
-    }
-
-    func testInvalidRequestKeepsDeveloperTextOutOfTheMessage() {
-        let error = CloudConvertError.invalidRequest(reason: "Task 'x' references unknown input 'y'.")
-        XCTAssertFalse(error.userFacingMessage.contains("unknown input"))
-    }
-
-    func testPausedConversionsSuggestTryingAgain() {
-        XCTAssertNotNil(CloudConvertError.jobTimedOut(jobID: "j").recoverySuggestion)
-        XCTAssertNil(CloudConvertError.emptyFile(URL(fileURLWithPath: "/a")).recoverySuggestion)
     }
 }

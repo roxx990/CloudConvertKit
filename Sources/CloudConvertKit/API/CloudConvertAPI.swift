@@ -123,7 +123,7 @@ public final class CloudConvertAPI: CloudConvertAPIClient, @unchecked Sendable {
         try specification.validate()
         let body = try encoder.encode(specification.requestBody)
         // A duplicate of an upload-only job just waits for an upload that
-        // never comes and expires unbilled, so those may be re-sent as before.
+        // never comes and expires unbilled, so those may be re-sent.
         let repeatable = specification.startsOnlyAfterUpload
         let response = try await sendRaw(method: "POST", path: "jobs", body: body, phase: .creatingJob, label: "createJob",
                                          policy: retryPolicy, isSafeToRepeat: { repeatable || $0.provesRequestWasNotProcessed })

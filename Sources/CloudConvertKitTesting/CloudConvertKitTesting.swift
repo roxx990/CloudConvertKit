@@ -13,7 +13,8 @@ import CloudConvertKit
 
 // MARK: - Fake API
 
-/// Scripted API: each call to `getJob` returns the next status in `statuses`.
+/// Scripted API: each call to `getJob` returns the next status of the
+/// current job's script (`jobStatusScripts`).
 public final class FakeCloudConvertAPI: CloudConvertAPIClient, @unchecked Sendable {
 
     public init() {}

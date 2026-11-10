@@ -4,22 +4,45 @@
 import XCTest
 @testable import CloudConvertKit
 
-// MARK: - Job builder
+// MARK: - Job specifications
 
 final class JobBuilderTests: XCTestCase {
 
-    func testBuilderRejectsMissingExport() {
-        var builder = JobBuilder()
-        _ = builder.importUpload(InputFile(url: URL(fileURLWithPath: "/tmp/a.txt")))
-        XCTAssertThrowsError(try builder.build())
+    func testJobSpecificationCarriesFormatsOptionsAndTimeout() throws {
+        let url = try TestFiles.makeFile(named: "song.wav")
+        var request = ConversionRequest.convert(url, to: "mp3", options: ["audio_bitrate": 192, "audio_channels": 2])
+        request.timeout = 120
+        let spec = try request.makeJobSpecification(defaultTag: "audio-app", defaultTimeout: 900)
+
+        XCTAssertEqual(spec.tag, "audio-app")
+        XCTAssertEqual(spec.uploadTaskNames, ["import-1"])
+        XCTAssertEqual(spec.exportTaskName, "export-1")
+        let convert = try XCTUnwrap(spec.task(named: "process-1"))
+        XCTAssertEqual(convert.operation, "convert")
+        XCTAssertEqual(convert.inputs, ["import-1"])
+        XCTAssertEqual(convert.options["output_format"], "mp3")
+        XCTAssertEqual(convert.options["input_format"], "wav")
+        XCTAssertEqual(convert.options["audio_bitrate"], 192)
+        XCTAssertEqual(convert.options["timeout"], 120)
+
+        let body = spec.requestBody
+        let data = try JSONEncoder().encode(body)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let tasks = try XCTUnwrap(json["tasks"] as? [String: Any])
+        XCTAssertEqual(Set(tasks.keys), ["import-1", "process-1", "export-1"])
+        let export = try XCTUnwrap(tasks["export-1"] as? [String: Any])
+        XCTAssertEqual(export["input"] as? String, "process-1")
     }
 
-    func testBuilderRejectsInvalidNames() {
-        var builder = JobBuilder()
-        let file = builder.importUpload(InputFile(url: URL(fileURLWithPath: "/tmp/a.txt")), name: "bad name!")
-        let pdf = builder.convert(file, to: "pdf")
-        builder.exportURL(pdf)
-        XCTAssertThrowsError(try builder.build())
+    func testMergeUsesSingleTaskWithArrayInput() throws {
+        let a = try TestFiles.makeFile(named: "a.pdf")
+        let b = try TestFiles.makeFile(named: "b.jpg")
+        let spec = try ConversionRequest.merge([a, b], outputFilename: "combined.pdf").makeJobSpecification(defaultTag: nil, defaultTimeout: nil)
+        let merge = try XCTUnwrap(spec.task(named: "process-1"))
+        XCTAssertEqual(merge.operation, "merge")
+        XCTAssertEqual(merge.inputs, ["import-1", "import-2"])
+        XCTAssertEqual(merge.options["filename"], "combined.pdf")
+        XCTAssertEqual(merge.wireObject["input"], ["import-1", "import-2"])
     }
 
     func testBuilderAppliesDefaultTimeoutToProcessingTasksOnly() throws {
@@ -34,11 +57,18 @@ final class JobBuilderTests: XCTestCase {
         XCTAssertNil(spec.task(named: "export")?.options["timeout"])
     }
 
-    func testFilenameSanitisation() {
-        XCTAssertEqual(FileStorage.sanitizedFilename("a/b\\c:d\"e.pdf"), "a-b-c-d'e.pdf")
-        XCTAssertEqual(FileStorage.sanitizedFilename(".hidden"), "_hidden")
-        XCTAssertEqual(FileStorage.sanitizedFilename("   "), "file")
-        XCTAssertEqual(FileStorage.outputName(for: "My Report.docx", outputFormat: "PDF"), "My Report.pdf")
+    func testBuilderRejectsMissingExport() {
+        var builder = JobBuilder()
+        _ = builder.importUpload(InputFile(url: URL(fileURLWithPath: "/tmp/a.txt")))
+        XCTAssertThrowsError(try builder.build())
+    }
+
+    func testBuilderRejectsInvalidNames() {
+        var builder = JobBuilder()
+        let file = builder.importUpload(InputFile(url: URL(fileURLWithPath: "/tmp/a.txt")), name: "bad name!")
+        let pdf = builder.convert(file, to: "pdf")
+        builder.exportURL(pdf)
+        XCTAssertThrowsError(try builder.build())
     }
 }
 

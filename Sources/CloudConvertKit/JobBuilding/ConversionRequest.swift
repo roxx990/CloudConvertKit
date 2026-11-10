@@ -224,7 +224,7 @@ public struct ConversionRequest: Equatable, Sendable, Codable {
         for (stepIndex, step) in steps.enumerated() {
             let isFirst = stepIndex == 0
             let isLast = stepIndex == steps.count - 1
-            // The first step keeps the 1.x task names (`process-1`…).
+            // Unique per step: `process-1`… for the first, `step2-1`… after it.
             let prefix = isFirst ? "process" : "step\(stepIndex + 1)"
             if step.operation.combinesInputs {
                 let options = taskOptions(step, isFirst: isFirst, isLast: isLast, inputFormat: nil)

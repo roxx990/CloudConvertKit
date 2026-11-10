@@ -3,7 +3,6 @@
 
 import XCTest
 @testable import CloudConvertKit
-import CloudConvertKitUI
 
 // MARK: - Models
 
@@ -42,6 +41,36 @@ final class ModelDecodingTests: XCTestCase {
         """
         let job = try CCDateDecoding.makeDecoder().decode(CCDataEnvelope<CCJob>.self, from: Data(json.utf8)).data
         XCTAssertEqual(job.failedTask?.name, "process-1")
+    }
+
+    func testOddTaskResultShapesDoNotFailTheJob() throws {
+        let json = """
+        {"data":{"id":"j","status":"processing","tasks":[
+          {"id":"1","name":"a","operation":"metadata","status":"finished","result":[]},
+          {"id":"2","name":"b","operation":"convert","status":"finished","result":{"files":[{"filename":"x"},{"filename":"y","url":"https://s/y"}],"metadata":[]}},
+          {"id":"3","name":"c","operation":"export/url","status":"waiting","result":{"files":"soon"}}]}}
+        """
+        let job = try CCDateDecoding.makeDecoder().decode(CCDataEnvelope<CCJob>.self, from: Data(json.utf8)).data
+        XCTAssertNil(job.task(named: "a")?.result)
+        XCTAssertEqual(job.task(named: "b")?.result?.files?.map(\.filename), ["y"])
+        XCTAssertNil(job.task(named: "b")?.result?.metadata)
+        XCTAssertNil(job.task(named: "c")?.result?.files)
+    }
+
+    /// Values the server or a proxy controls never trap.
+    func testNumbersOutOfRangeDecodeAsUnknown() throws {
+        for credits in [#""inf""#, "1e20", #""1e20""#, #""nan""#] {
+            let json = #"{"id":"t","operation":"convert","status":"finished","credits":\#(credits)}"#
+            XCTAssertNil(try CCDateDecoding.makeDecoder().decode(CCTask.self, from: Data(json.utf8)).credits, credits)
+        }
+        let whole = #"{"id":"t","operation":"convert","status":"finished","credits":2.0}"#
+        XCTAssertEqual(try CCDateDecoding.makeDecoder().decode(CCTask.self, from: Data(whole.utf8)).credits, 2)
+        XCTAssertNil(JSONValue.double(1e20).intValue)
+        XCTAssertNil(JSONValue.double(.infinity).intValue)
+        XCTAssertNil(JSONValue.double(2.5).intValue)
+        XCTAssertEqual(JSONValue.double(3).intValue, 3)
+        XCTAssertEqual([Int64.max, 1].saturatingSum(), .max)
+        XCTAssertEqual([Int.min, -1].saturatingSum(), .min)
     }
 
     func testJSONValueRoundTrip() throws {
@@ -150,32 +179,31 @@ final class FixtureDecodingTests: XCTestCase {
         XCTAssertEqual(task.failureCode, .other("UNKNOWN"))
         XCTAssertFalse(TaskFailureCode.other("SOMETHING_NEW").isRetryable, "unknown codes must not rebuild (and re-bill) the job")
     }
-
-    func testOddTaskResultShapesDoNotFailTheJob() throws {
-        let json = """
-        {"data":{"id":"j","status":"processing","tasks":[
-          {"id":"1","name":"a","operation":"metadata","status":"finished","result":[]},
-          {"id":"2","name":"b","operation":"convert","status":"finished","result":{"files":[{"filename":"x"},{"filename":"y","url":"https://s/y"}],"metadata":[]}},
-          {"id":"3","name":"c","operation":"export/url","status":"waiting","result":{"files":"soon"}}]}}
-        """
-        let job = try CCDateDecoding.makeDecoder().decode(CCDataEnvelope<CCJob>.self, from: Data(json.utf8)).data
-        XCTAssertNil(job.task(named: "a")?.result)
-        XCTAssertEqual(job.task(named: "b")?.result?.files?.map(\.filename), ["y"])
-        XCTAssertNil(job.task(named: "b")?.result?.metadata)
-        XCTAssertNil(job.task(named: "c")?.result?.files)
-    }
-
-    func testConversionFailedMessageIsReadable() {
-        let error = CloudConvertError.jobFailed(jobID: "j", taskName: "convert", code: .conversionFailed, message: "Conversion failed")
-        XCTAssertFalse(error.userFacingMessage.contains("Conversion failed: Conversion failed"))
-        XCTAssertFalse(error.isRetryable)
-        XCTAssertFalse(error.requiresNewJob)
-    }
 }
 
 // MARK: - URLs
 
-final class LenientURLTests: XCTestCase {
+final class URLDecodingTests: XCTestCase {
+
+    /// A URL with invalid characters decodes as iOS 17 and macOS 14 make it,
+    /// on every supported system, so its file is never dropped.
+    func testURLsDecodeTheSameOnEverySystem() throws {
+        let expected = [
+            "https://s.example/a b.pdf?x=1 2#f g": "https://s.example/a%20b.pdf?x=1%202#f%20g",
+            "https://s.example/a|b[1].pdf": "https://s.example/a%7Cb%5B1%5D.pdf",
+            "https://s.example/ü.pdf": "https://s.example/%C3%BC.pdf",
+            "https://[::1]:8080/a b": "https://[::1]:8080/a%20b",
+            "https://s.example/50%off": "https://s.example/50%25off",
+            "https://s.example/a%20b": "https://s.example/a%20b",
+        ]
+        for (raw, encoded) in expected {
+            XCTAssertEqual(URL.encodingInvalidCharacters(raw), encoded, raw)
+            XCTAssertEqual(URL(lenient: raw)?.absoluteString, encoded, raw)
+        }
+        let json = #"{"files":[{"filename":"a b.pdf","size":1,"url":"https://storage.example/a b.pdf"}]}"#
+        let result = try JSONDecoder().decode(CCTaskResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.files?.map(\.url.absoluteString), ["https://storage.example/a%20b.pdf"], "the file is not dropped")
+    }
 
     /// The encoding `URL(lenient:)` falls back to parses with the strict,
     /// pre-iOS 17 rules, into the URL iOS 17 makes of the raw string.

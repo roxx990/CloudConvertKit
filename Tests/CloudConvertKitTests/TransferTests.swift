@@ -1,11 +1,10 @@
-//  Background transfers: the session handoff, cancellation, and
-//  re-attaching to transfers a previous launch started.
+//  Background transfers and background time: the session handoff,
+//  cancellation, and re-attaching to transfers a previous launch started.
 //
 
 import XCTest
 import Network
 @testable import CloudConvertKit
-import CloudConvertKitUI
 
 // MARK: - Transfer manager
 
@@ -43,7 +42,7 @@ final class BackgroundTransferManagerTests: XCTestCase {
         throw CloudConvertError.transferLost(id: id)
     }
 
-    /// #4: iOS cancels background transfers when the user force-quits the
+    /// iOS cancels background transfers when the user force-quits the
     /// app. That is a lost transfer, to start again, not a user cancellation
     /// (which would delete the paid job).
     func testCancellationByTheSystemIsALostTransfer() async throws {
@@ -62,7 +61,7 @@ final class BackgroundTransferManagerTests: XCTestCase {
         }
     }
 
-    /// #4: a cancellation the engine asked for is still a cancellation.
+    /// A cancellation the engine asked for is still a cancellation.
     func testCancellationTheEngineAskedForIsACancellation() async throws {
         let manager = makeManager()
         let (waiter, _) = try await startUpload(on: manager, id: "cancelled-by-the-user")
@@ -78,7 +77,7 @@ final class BackgroundTransferManagerTests: XCTestCase {
         }
     }
 
-    /// #7: engines created at the same time for one identifier share one
+    /// Engines created at the same time for one identifier share one
     /// manager, so one background session.
     func testConcurrentCreationMakesOneManagerPerIdentifier() async {
         let identifier = "tests.\(UUID().uuidString)"
@@ -202,30 +201,7 @@ final class TransferCancellationTests: XCTestCase {
 
 // MARK: - Re-attaching
 
-final class ReattachTests: XCTestCase {
-
-    private var api: FakeAPI!
-    private var transfers: FakeTransfers!
-    private var configuration: CloudConvertConfiguration!
-    private var engine: ConversionEngine!
-    private var directories: [URL] = []
-
-    override func setUp() {
-        super.setUp()
-        api = FakeAPI()
-        transfers = FakeTransfers()
-        let work = TestFiles.temporaryDirectory(), out = TestFiles.temporaryDirectory()
-        directories = [work, out]
-        configuration = .testing(workingDirectory: work, outputDirectory: out)
-        let transfers = self.transfers!
-        api.serverHasUpload = { transfers.receivedUploadsSnapshot > 0 }
-        engine = ConversionEngine(configuration: configuration, api: api, transfers: transfers, connectivity: AlwaysOnline())
-    }
-
-    override func tearDown() {
-        directories.forEach { try? FileManager.default.removeItem(at: $0) }
-        super.tearDown()
-    }
+final class ReattachTests: EngineTestCase {
 
     /// The app died mid-upload; the upload of `import-1` was still running.
     private func seedInterruptedUpload() async throws {
@@ -234,7 +210,21 @@ final class ReattachTests: XCTestCase {
         }
     }
 
-    /// #3: a re-attached upload that storage answered with a 503 is retried
+    /// A re-attached upload that succeeded while the app was away is
+    /// not sent again.
+    func testReattachedUploadThatSucceededIsNotSentAgain() async throws {
+        try await seedInterruptedUpload()
+        transfers.reattach = { _ in outcome(201) }
+        api.jobStatusScript = [.waiting, .processing, .finished]
+
+        let handles = await engine.resumePendingConversions()
+        let result = try await XCTUnwrap(handles.first).result
+
+        XCTAssertEqual(result.jobID, "job-9")
+        XCTAssertTrue(transfers.uploads.isEmpty)
+    }
+
+    /// A re-attached upload that storage answered with a 503 is retried
     /// against the same form, as a fresh one is, instead of rebuilding the job.
     func testReattachedUploadAnswered503IsRetriedAgainstTheSameForm() async throws {
         try await seedInterruptedUpload()
@@ -250,7 +240,7 @@ final class ReattachTests: XCTestCase {
         XCTAssertEqual(transfers.uploads.count, 1)
     }
 
-    /// #3: a re-attached upload whose connection dropped waits for the
+    /// A re-attached upload whose connection dropped waits for the
     /// network and is retried, instead of failing the conversion.
     func testReattachedUploadThatLostTheNetworkIsRetried() async throws {
         try await seedInterruptedUpload()
@@ -265,7 +255,7 @@ final class ReattachTests: XCTestCase {
         XCTAssertEqual(transfers.uploads.count, 1)
     }
 
-    /// #3: a re-attached download answered with a 503 is retried like a
+    /// A re-attached download answered with a 503 is retried like a
     /// fresh one; the paid job is neither failed nor deleted.
     func testReattachedDownloadAnswered503IsRetried() async throws {
         let file = CCExportedFile(filename: "book.mobi", size: 9, url: URL(string: "https://storage.example/book.mobi")!)
@@ -285,21 +275,49 @@ final class ReattachTests: XCTestCase {
         XCTAssertEqual(api.deletedJobIDsSnapshot, ["job-9"], "deleted once the output is saved, not before")
     }
 
-    /// #13: a re-attached upload that succeeded while the app was away is
-    /// not sent again.
-    func testReattachedUploadThatSucceededIsNotSentAgain() async throws {
-        try await seedInterruptedUpload()
-        transfers.reattach = { _ in outcome(201) }
+    /// Resuming after a relaunch: the previous launch's upload reaches
+    /// storage and only its response is lost, and by the device clock the
+    /// form has expired. The job that has the file converts it.
+    func testReattachedUploadThatArrivedKeepsTheJobAlthoughTheFormLooksExpired() async throws {
+        let arrived = Flag()
+        api.serverHasUpload = { arrived.isSet }
+        try await seedPreviousLaunch(phase: .uploading, configuration: configuration, api: api) {
+            $0.uploadTransfers = ["import-1": "upload-from-last-launch"]
+        }
+        api.formExpiresIn = -3600
         api.jobStatusScript = [.waiting, .processing, .finished]
+        transfers.reattach = { _ in
+            arrived.set()
+            throw CloudConvertError.network(code: .networkConnectionLost, description: "lost")
+        }
 
-        let handles = await engine.resumePendingConversions()
+        let handles = await makeEngine().resumePendingConversions()
         let result = try await XCTUnwrap(handles.first).result
 
         XCTAssertEqual(result.jobID, "job-9")
+        XCTAssertTrue(api.createdSpecifications.isEmpty, "a second job \(api.createdJobIDs) converts and bills the file again")
         XCTAssertTrue(transfers.uploads.isEmpty)
     }
 
-    /// #13: cancelling while waiting on a re-attached transfer cancels the
+    /// Same, with nothing delivered: the expired form rebuilds the job.
+    func testReattachedUploadThatDidNotArriveRebuildsAnExpiredForm() async throws {
+        try await seedPreviousLaunch(phase: .uploading, configuration: configuration, api: api) {
+            $0.uploadTransfers = ["import-1": "upload-from-last-launch"]
+        }
+        api.formExpiresIn = -3600
+        api.jobStatusScript = [.waiting, .waiting, .processing, .finished]     // job-9 still offers its form when checked
+        transfers.reattach = { _ in throw CloudConvertError.network(code: .networkConnectionLost, description: "lost") }
+
+        let handles = await makeEngine().resumePendingConversions()
+        let result = try await XCTUnwrap(handles.first).result
+
+        XCTAssertEqual(result.jobID, "job-1")
+        XCTAssertEqual(transfers.uploads.count, 1)
+        for _ in 0..<100 where !api.deletedJobIDsSnapshot.contains("job-9") { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertTrue(api.deletedJobIDsSnapshot.contains("job-9"), "the job without the file is deleted")
+    }
+
+    /// Cancelling while waiting on a re-attached transfer cancels the
     /// conversion and cleans up.
     func testCancellingWhileWaitingOnAReattachedTransfer() async throws {
         try await seedInterruptedUpload()
@@ -321,5 +339,16 @@ final class ReattachTests: XCTestCase {
         XCTAssertEqual(api.deletedJobIDsSnapshot, ["job-9"])
         let pending = await engine.pendingConversions()
         XCTAssertTrue(pending.isEmpty)
+    }
+}
+
+// MARK: - Background time
+
+final class SystemBackgroundActivityTests: XCTestCase {
+    func testBeginAndEnd() {
+        let activity = SystemBackgroundActivity()
+        let token = activity.beginActivity(named: "test")
+        XCTAssertNotNil(token)
+        if let token { activity.endActivity(token) }
     }
 }

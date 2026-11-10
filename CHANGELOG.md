@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.0.1
+
+Nothing changes in the package itself; it is now tested on every change and released from tags, its tests are organised by subject, and its documentation is split into pages.
+
+- **CI.** GitHub Actions runs the whole suite on every push to `main` and every pull request: on macOS, under Thread Sanitizer and on the newest iPhone simulator, and builds it for an iOS device and Mac Catalyst. See [Testing](Docs/Testing.md#ci).
+- **Releases from tags.** Pushing a version tag on `main` runs the tests on it and publishes the GitHub release, with the version's changelog section as its notes. See [Releasing](CONTRIBUTING.md#releasing).
+- **Tests by subject.** The engine's tests are split into `PipelineTests`, `FailureHandlingTests`, `CancellationTests`, `ResumeTests`, `EngineControlTests` and `RealAPIClientTests`, on a shared `EngineTestCase` in place of seven copies of the same setup; storage tests have a file of their own, and the shared helpers are in `Support/`. Two tests that repeated others are gone (an undecodable poll, credits on the result: both checked with the real API client), three that differed only in the failure code are one, and a hand-built resume record gives way to `seedPreviousLaunch`: 171 tests, from 175, with the same coverage. See [Testing](Docs/Testing.md).
+- **A test fixed on iOS.** `testLowCreditsAreReported` dropped its engine when `convert` returned, before the credit check that follows it ran, so it failed on the iOS simulator. It keeps the engine, as an app does.
+- **Documentation.** The README keeps installation, a quick start and an index; the rest moves to `Docs/` (Configuration, Converting, SwiftUI, App lifecycle, Errors, Edge cases, Architecture, Testing, Migrating from 1.x), and contributing and releasing to `CONTRIBUTING.md`.
+
 ## 2.0.0
 
 Fixes and additions from running the kit in production apps, on iOS and macOS. Breaking changes are listed under **Migrating from 1.x** in the README; in short: a Swift 6 toolchain, `direct(apiKey:environment:)` without a default environment, `handleUnauthorized(rejected:)`, `maxConcurrentConversions` applied by the engine, and new error cases.

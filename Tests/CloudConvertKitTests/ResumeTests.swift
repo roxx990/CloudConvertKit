@@ -1,48 +1,55 @@
 //  Conversions kept when the network or the polling deadline runs out, and
-//  resumed later.
+//  resumed later: in this process, after a relaunch, from every phase.
 //
 
 import XCTest
 import Network
 @testable import CloudConvertKit
-import CloudConvertKitUI
 
 // MARK: - Interruptions
 
-final class InterruptionTests: XCTestCase {
+final class InterruptionTests: EngineTestCase {
 
-    private var api: FakeAPI!
-    private var transfers: FakeTransfers!
-    private var configuration: CloudConvertConfiguration!
-    private var engine: ConversionEngine!
-    private var directories: [URL] = []
+    // MARK: Offline
 
-    override func setUp() {
-        super.setUp()
-        api = FakeAPI()
-        transfers = FakeTransfers()
-        let work = TestFiles.temporaryDirectory(), out = TestFiles.temporaryDirectory()
-        directories = [work, out]
-        configuration = .testing(workingDirectory: work, outputDirectory: out)
-        let transfers = self.transfers!
-        api.serverHasUpload = { transfers.receivedUploadsSnapshot > 0 }
-        engine = makeEngine()
+    func testOfflineTimeoutFailsOnceWithoutRebuildingJob() async throws {
+        engine = makeEngine(connectivity: AlwaysOffline())
+        let log = StageLog()
+
+        do {
+            _ = try await engine.convert(try request()) { log.append($0.stage) }
+            XCTFail("expected failure")
+        } catch let error as CloudConvertError {
+            guard case .notConnected = error else { return XCTFail("unexpected \(error)") }
+            XCTAssertTrue(error.isRetryable, "the app may offer Try again")
+            XCTAssertTrue(error.isConnectivityRelated, "the app should show an offline banner")
+        }
+        XCTAssertTrue(api.createdSpecifications.isEmpty, "nothing is sent while offline")
+        XCTAssertTrue(log.snapshot.contains(.waitingForNetwork))
+        XCTAssertEqual(log.snapshot.filter { $0 == .failed }.count, 1, "exactly one terminal stage")
+        XCTAssertEqual(log.snapshot.last, .failed)
+        let pending = await engine.pendingConversions()
+        XCTAssertTrue(pending.isEmpty)
     }
 
-    override func tearDown() {
-        directories.forEach { try? FileManager.default.removeItem(at: $0) }
-        super.tearDown()
+    func testATransferReportsWaitingForNetworkWhileOffline() async throws {
+        transfers.uploadDelay = 0.2
+        let network = FakeConnectivity()
+        let engine = makeEngine(connectivity: network)
+        let log = StageLog()
+        let request = try request()
+        let task = Task { try await engine.convert(request) { log.append($0.stage) } }
+        await waitUntil { log.snapshot.contains(.uploading) }
+        network.isConnected = false
+        await waitUntil { log.snapshot.contains(.waitingForNetwork) }
+        network.isConnected = true
+        _ = try await task.value
+        let stages = log.snapshot
+        let offline = try XCTUnwrap(stages.firstIndex(of: .waitingForNetwork))
+        XCTAssertTrue(stages[(offline + 1)...].contains(.uploading))
     }
 
-    private func makeEngine(connectivity: any ConnectivityMonitoring = AlwaysOnline()) -> ConversionEngine {
-        ConversionEngine(configuration: configuration, api: api, transfers: transfers, connectivity: connectivity)
-    }
-
-    private func request() throws -> ConversionRequest {
-        ConversionRequest.convert(try TestFiles.makeFile(named: "book.epub"), to: "mobi")
-    }
-
-    /// #2: the network goes for longer than the wait once the job exists.
+    /// The network goes for longer than the wait once the job exists.
     /// The job may finish, and be billed, so it is kept; resuming when the
     /// network is back finishes it without a second job or upload.
     func testLosingTheNetworkAfterUploadKeepsTheConversion() async throws {
@@ -82,7 +89,7 @@ final class InterruptionTests: XCTestCase {
         XCTAssertTrue(left.isEmpty)
     }
 
-    /// #2: resuming at launch while offline keeps the conversion pending.
+    /// Resuming at launch while offline keeps the conversion pending.
     func testResumingWhileOfflineKeepsThePendingConversion() async throws {
         let record = try await seedPreviousLaunch(phase: .processing, configuration: configuration, api: api)
         engine = makeEngine(connectivity: DroppedNetwork())
@@ -102,7 +109,39 @@ final class InterruptionTests: XCTestCase {
         XCTAssertTrue(record.staged.values.allSatisfy { FileManager.default.fileExists(atPath: $0.stagedURL.path) })
     }
 
-    /// #1: a poll that took longer than the whole deadline (the app was
+    func testAConversionKeptOfflineContinuesWhenTheNetworkReturns() async throws {
+        configuration.resumesWhenOnline = true
+        configuration.offlineWaitTimeout = 0.1
+        let network = FakeConnectivity()
+        let engine = makeEngine(connectivity: network)
+        let resumes = engine.automaticResumes()
+        api.getJobHook = { [api] _ in
+            if network.isConnected, api!.pollCount == 0 {
+                network.isConnected = false
+                api!.getJobErrors = [.notConnected]
+            }
+        }
+
+        do {
+            _ = try await engine.convert(try request())
+            XCTFail("expected the conversion to pause")
+        } catch let error as CloudConvertError {
+            XCTAssertEqual(error.category, .paused)
+        }
+        api.getJobHook = nil
+        network.isConnected = true
+
+        // Bounded: if nothing resumes, the test fails instead of hanging the suite.
+        let handle = try await XCTUnwrapAsync(await withTimeout(seconds: 5) { await resumes.first { _ in true } } ?? nil,
+                                              "nothing resumed when the network came back")
+        let result = try await handle.result
+        XCTAssertEqual(result.files.count, 1)
+        XCTAssertEqual(api.createdJobIDs.count, 1)
+    }
+
+    // MARK: The polling deadline
+
+    /// A poll that took longer than the whole deadline (the app was
     /// suspended mid-request) does not count against it, and the job that
     /// finished meanwhile is picked up instead of deleted.
     func testTimeTheAppSpentSuspendedDoesNotCountTowardsTheDeadline() async throws {
@@ -117,7 +156,7 @@ final class InterruptionTests: XCTestCase {
         XCTAssertEqual(api.createdSpecifications.count, 1)
     }
 
-    /// #1: when the deadline passes with the job still running, the job is
+    /// When the deadline passes with the job still running, the job is
     /// kept, not deleted, and resuming later picks it up.
     func testPollingDeadlineKeepsAJobThatIsStillRunning() async throws {
         configuration.polling.jobTimeout = 0.05
@@ -143,129 +182,6 @@ final class InterruptionTests: XCTestCase {
         XCTAssertEqual(transfers.uploads.count, 1)
     }
 
-    /// Only the two errors a kept conversion ends with are resumable.
-    func testOnlyTheErrorsOfAKeptConversionAreResumable() {
-        let offline = CloudConvertError.timedOut(phase: .waitingForNetwork)
-        XCTAssertTrue(offline.isResumable)
-        XCTAssertTrue(offline.isConnectivityRelated)
-        XCTAssertFalse(offline.isRetryable)
-        XCTAssertTrue(CloudConvertError.jobTimedOut(jobID: "j").isResumable)
-        for error: CloudConvertError in [.notConnected, .timedOut(phase: .processing), .network(code: .networkConnectionLost, description: ""),
-                                         .jobLost(jobID: "j"), .cancelled] {
-            XCTAssertFalse(error.isResumable, "\(error)")
-        }
-        XCTAssertTrue(CloudConvertError.timedOut(phase: .processing).isRetryable)
-        XCTAssertFalse(CloudConvertError.timedOut(phase: .processing).isConnectivityRelated)
-    }
-
-    /// `resumePendingConversions(where:)` starts only the records it accepts
-    /// and leaves the others exactly as they were.
-    func testResumingSelectedConversionsLeavesTheOthersAlone() async throws {
-        _ = try await seedPreviousLaunch(id: "mine", phase: .processing, jobID: "job-9", configuration: configuration, api: api)
-        _ = try await seedPreviousLaunch(id: "other", phase: .processing, jobID: "job-10", configuration: configuration, api: api)
-        let other = await engine.pendingConversions().filter { $0.id == "other" }
-
-        let handles = await engine.resumePendingConversions(where: { $0.id == "mine" })
-
-        XCTAssertEqual(handles.map(\.id), ["mine"])
-        let pendingWhileRunning = await engine.pendingConversions()
-        XCTAssertEqual(pendingWhileRunning.map(\.id), ["other"], "the other record is not marked as running")
-        _ = try await XCTUnwrap(handles.first).result
-        let pending = await engine.pendingConversions()
-        XCTAssertEqual(pending, other, "the other record is untouched")
-        XCTAssertFalse(api.polledJobIDs.contains("job-10"), "the other conversion was not started")
-    }
-}
-
-// MARK: - Resuming
-
-final class ResumeEngineTests: XCTestCase {
-
-    private var api: FakeAPI!
-    private var transfers: FakeTransfers!
-    private var configuration: CloudConvertConfiguration!
-    private var directories: [URL] = []
-
-    override func setUp() {
-        super.setUp()
-        api = FakeAPI()
-        transfers = FakeTransfers()
-        let work = TestFiles.temporaryDirectory(), out = TestFiles.temporaryDirectory()
-        directories = [work, out]
-        configuration = .testing(workingDirectory: work, outputDirectory: out)
-        let transfers = self.transfers!
-        api.serverHasUpload = { transfers.receivedUploadsSnapshot > 0 }
-    }
-
-    override func tearDown() {
-        directories.forEach { try? FileManager.default.removeItem(at: $0) }
-        super.tearDown()
-    }
-
-    private func makeEngine(connectivity: any ConnectivityMonitoring = AlwaysOnline(),
-                            store: (any ConversionRecordStoring)? = nil) -> ConversionEngine {
-        ConversionEngine(configuration: configuration, api: api, transfers: transfers, connectivity: connectivity, store: store)
-    }
-
-    private func request() throws -> ConversionRequest {
-        ConversionRequest.convert(try TestFiles.makeFile(named: "book.epub"), to: "mobi")
-    }
-
-    /// Online the whole time; storage is slow, so every upload attempt times
-    /// out and nothing arrives. The job is rebuilt with a fresh form instead
-    /// of being kept as if the device were offline.
-    func testUploadTimeoutsWhileOnlineRebuildTheJob() async throws {
-        transfers.uploadStatuses = [500, 500, 500, 201]
-        transfers.lostResponses = 3
-        let result = try await makeEngine().convert(try request())
-
-        XCTAssertEqual(result.jobID, "job-2")
-        let pending = await makeEngine().pendingConversions()
-        XCTAssertTrue(pending.isEmpty)
-    }
-
-    /// Resuming after a relaunch: the previous launch's upload reaches
-    /// storage and only its response is lost, and by the device clock the
-    /// form has expired. The job that has the file converts it.
-    func testReattachedUploadThatArrivedKeepsTheJobAlthoughTheFormLooksExpired() async throws {
-        let arrived = Flag()
-        api.serverHasUpload = { arrived.isSet }
-        try await seedPreviousLaunch(phase: .uploading, configuration: configuration, api: api) {
-            $0.uploadTransfers = ["import-1": "upload-from-last-launch"]
-        }
-        api.formExpiresIn = -3600
-        api.jobStatusScript = [.waiting, .processing, .finished]
-        transfers.reattach = { _ in
-            arrived.set()
-            throw CloudConvertError.network(code: .networkConnectionLost, description: "lost")
-        }
-
-        let handles = await makeEngine().resumePendingConversions()
-        let result = try await XCTUnwrap(handles.first).result
-
-        XCTAssertEqual(result.jobID, "job-9")
-        XCTAssertTrue(api.createdSpecifications.isEmpty, "a second job \(api.createdJobIDs) converts and bills the file again")
-        XCTAssertTrue(transfers.uploads.isEmpty)
-    }
-
-    /// Same, with nothing delivered: the expired form rebuilds the job.
-    func testReattachedUploadThatDidNotArriveRebuildsAnExpiredForm() async throws {
-        try await seedPreviousLaunch(phase: .uploading, configuration: configuration, api: api) {
-            $0.uploadTransfers = ["import-1": "upload-from-last-launch"]
-        }
-        api.formExpiresIn = -3600
-        api.jobStatusScript = [.waiting, .waiting, .processing, .finished]     // job-9 still offers its form when checked
-        transfers.reattach = { _ in throw CloudConvertError.network(code: .networkConnectionLost, description: "lost") }
-
-        let handles = await makeEngine().resumePendingConversions()
-        let result = try await XCTUnwrap(handles.first).result
-
-        XCTAssertEqual(result.jobID, "job-1")
-        XCTAssertEqual(transfers.uploads.count, 1)
-        for _ in 0..<100 where !api.deletedJobIDsSnapshot.contains("job-9") { try await Task.sleep(nanoseconds: 10_000_000) }
-        XCTAssertTrue(api.deletedJobIDsSnapshot.contains("job-9"), "the job without the file is deleted")
-    }
-
     /// `initialInterval: 0` and a multiplier below 1 would never add up to
     /// `jobTimeout`; the deadline is still reached.
     func testPollingReachesTheDeadlineWithAZeroOrShrinkingInterval() async throws {
@@ -287,30 +203,113 @@ final class ResumeEngineTests: XCTestCase {
             for record in await engine.pendingConversions() { await engine.discardPendingConversion(id: record.id) }
         }
     }
+}
 
-    /// The user cancels while a status check finds the device offline, and
-    /// the wait for the network then gives up: a cancellation, not kept.
-    func testCancellingDuringAnOfflinePollIsACancellation() async throws {
-        let engine = makeEngine(connectivity: DroppedNetwork())
-        let handleBox = HandleBox(), calls = Counter()
-        api.getJobHook = { _ in
-            if calls.next() == 1 {
-                handleBox.handle?.cancel()
-                throw CloudConvertError.notConnected
-            }
-        }
+// MARK: - Resuming
+
+final class ResumeTests: EngineTestCase {
+
+    func testRunningConversionIsNotReportedAsPending() async throws {
+        transfers.uploadDelay = 0.2
         let handle = engine.start(try request())
-        handleBox.handle = handle
+        await waitUntil { !self.transfers.uploads.isEmpty }
 
-        do {
-            _ = try await handle.result
-            XCTFail("expected an error")
-        } catch let error as CloudConvertError {
-            XCTAssertTrue(error.isCancellation, "cancelled by the user, ended with \(error)")
-        }
         let pending = await engine.pendingConversions()
-        XCTAssertTrue(pending.isEmpty, "a conversion the user cancelled was kept: \(pending.map(\.id))")
+        XCTAssertTrue(pending.isEmpty, "a conversion running in this process is not pending")
+        let resumed = await engine.resumePendingConversions()
+        XCTAssertTrue(resumed.isEmpty, "and must not be started a second time")
+
+        _ = try await handle.result
+        XCTAssertEqual(api.createdSpecifications.count, 1)
+        XCTAssertEqual(transfers.uploads.count, 1)
     }
+
+    /// A conversion a previous launch left while the server converted it
+    /// continues with its job and its `userInfo`: nothing is uploaded or
+    /// created again, and the job is deleted once the output is saved.
+    func testAKeptConversionContinuesWithItsJob() async throws {
+        try await seedPreviousLaunch(phase: .processing, configuration: configuration, api: api) {
+            $0.userInfo = ["historyRow": "7"]
+        }
+        api.jobStatusScript = [.processing, .finished]
+
+        let handles = await engine.resumePendingConversions()
+        XCTAssertEqual(handles.count, 1)
+        let result = try await XCTUnwrap(handles.first).result
+
+        XCTAssertEqual(result.jobID, "job-9")
+        XCTAssertEqual(result.userInfo["historyRow"], "7")
+        XCTAssertEqual(result.files.count, 1)
+        XCTAssertTrue(transfers.uploads.isEmpty, "the upload had already completed; it must not be repeated")
+        XCTAssertTrue(api.createdSpecifications.isEmpty, "the existing job is reused, not recreated")
+        await waitUntil { self.api.deletedJobIDsSnapshot == ["job-9"] }
+        XCTAssertEqual(api.deletedJobIDsSnapshot, ["job-9"])
+        let pending = await engine.pendingConversions()
+        XCTAssertTrue(pending.isEmpty)
+    }
+
+    /// `resumePendingConversions(where:)` starts only the records it accepts
+    /// and leaves the others exactly as they were.
+    func testResumingSelectedConversionsLeavesTheOthersAlone() async throws {
+        _ = try await seedPreviousLaunch(id: "mine", phase: .processing, jobID: "job-9", configuration: configuration, api: api)
+        _ = try await seedPreviousLaunch(id: "other", phase: .processing, jobID: "job-10", configuration: configuration, api: api)
+        let other = await engine.pendingConversions().filter { $0.id == "other" }
+
+        let handles = await engine.resumePendingConversions(where: { $0.id == "mine" })
+
+        XCTAssertEqual(handles.map(\.id), ["mine"])
+        let pendingWhileRunning = await engine.pendingConversions()
+        XCTAssertEqual(pendingWhileRunning.map(\.id), ["other"], "the other record is not marked as running")
+        _ = try await XCTUnwrap(handles.first).result
+        let pending = await engine.pendingConversions()
+        XCTAssertEqual(pending, other, "the other record is untouched")
+        XCTAssertFalse(api.polledJobIDs.contains("job-10"), "the other conversion was not started")
+    }
+
+    func testConcurrentResumesRunAKeptRecordOnce() async throws {
+        try await seedPreviousLaunch(phase: .processing, configuration: configuration, api: api)
+        let gate = Gate()
+        api.getJobHook = { _ in try await gate.wait() }
+        let engine = makeEngine()
+        async let a = engine.resumePendingConversions()
+        async let b = engine.resumePendingConversions()
+        async let c = engine.resumePendingConversions(where: { _ in true })
+        let handles = await a + b + c
+        XCTAssertEqual(handles.count, 1)
+        let pendingWhileRunning = await engine.pendingConversions()
+        XCTAssertTrue(pendingWhileRunning.isEmpty, "a running conversion is not pending")
+        gate.open()
+        _ = try await handles.first?.result
+    }
+
+    /// A record listed as pending but finished by the time it is claimed (its
+    /// record deleted) is not run again from the stale copy.
+    func testARecordThatFinishedBeforeItIsClaimedIsNotRun() async throws {
+        let record = try await seedPreviousLaunch(phase: .processing, configuration: configuration, api: api)
+        let engine = makeEngine(store: StaleListStore(listed: [record]))
+
+        let handles = await engine.resumePendingConversions()
+
+        XCTAssertTrue(handles.isEmpty)
+        XCTAssertEqual(api.pollCount, 0)
+        XCTAssertTrue(api.createdSpecifications.isEmpty)
+    }
+
+    /// A record without the optional `key`, `credits` and `formatVersion`
+    /// (as `seedPreviousLaunch` writes it) decodes and resumes.
+    func testARecordWithoutTheNewerFieldsResumes() async throws {
+        let record = try await seedPreviousLaunch(phase: .processing, configuration: configuration, api: api)
+        let file = FileStorage(workingDirectory: configuration.workingDirectory, outputDirectory: configuration.outputDirectory,
+                               diskSpaceSafetyMargin: 0).recordsDirectory.appendingPathComponent("\(record.id).json")
+        let json = try String(contentsOf: file, encoding: .utf8)
+        XCTAssertFalse(json.contains("formatVersion") || json.contains("\"key\"") || json.contains("\"credits\""))
+
+        let handles = await makeEngine().resumePendingConversions()
+        let result = try await XCTUnwrap(handles.first).result
+        XCTAssertEqual(result.jobID, "job-9")
+    }
+
+    // MARK: Following a resume
 
     /// `resumedConversion(id:)` follows a resume while it runs and after it
     /// succeeds, without running it twice.
@@ -387,20 +386,7 @@ final class ResumeEngineTests: XCTestCase {
         XCTAssertNil(engine.resumedConversion(id: handle.id), "discarded")
     }
 
-    /// A record listed as pending but finished by the time it is claimed (its
-    /// record deleted) is not run again from the stale copy.
-    func testARecordThatFinishedBeforeItIsClaimedIsNotRun() async throws {
-        let record = try await seedPreviousLaunch(phase: .processing, configuration: configuration, api: api)
-        let engine = makeEngine(store: StaleListStore(listed: [record]))
-
-        let handles = await engine.resumePendingConversions()
-
-        XCTAssertTrue(handles.isEmpty)
-        XCTAssertEqual(api.pollCount, 0)
-        XCTAssertTrue(api.createdSpecifications.isEmpty)
-    }
-
-    // MARK: Kept conversions resume from every phase
+    // MARK: Kept in every phase
 
     private func keptThenResumed(failUploads: Bool, failDownloads: Bool) async throws -> (phase: ConversionPhase, result: ConversionResult) {
         let network = DroppedNetwork()
@@ -422,39 +408,6 @@ final class ResumeEngineTests: XCTestCase {
         let left = await engine.pendingConversions()
         XCTAssertTrue(left.isEmpty)
         return (phase, result)
-    }
-
-    func testKeptDuringUploadResumesWithTheSameJob() async throws {
-        api.jobStatusScript = [.waiting, .processing, .finished]
-        let (phase, result) = try await keptThenResumed(failUploads: true, failDownloads: false)
-        XCTAssertEqual(phase, .uploading)
-        XCTAssertEqual(result.jobID, "job-1")
-        XCTAssertEqual(api.createdSpecifications.count, 1)
-        XCTAssertEqual(transfers.uploads.count, 1)
-    }
-
-    func testKeptDuringDownloadResumesWithoutPollingAgain() async throws {
-        api.taskCredits = 2
-        let (phase, result) = try await keptThenResumed(failUploads: false, failDownloads: true)
-        XCTAssertEqual(phase, .downloading)
-        XCTAssertEqual(result.files.count, 1)
-        XCTAssertEqual(result.credits, 2, "the credits the job reported before the pause")
-        XCTAssertEqual(api.createdSpecifications.count, 1)
-        XCTAssertEqual(transfers.uploads.count, 1)
-    }
-
-    /// Records written before `key`, `credits` and `formatVersion` existed
-    /// (as `seedPreviousLaunch` writes them) still decode and resume.
-    func testARecordWithoutTheNewerFieldsResumes() async throws {
-        let record = try await seedPreviousLaunch(phase: .processing, configuration: configuration, api: api)
-        let file = FileStorage(workingDirectory: configuration.workingDirectory, outputDirectory: configuration.outputDirectory,
-                               diskSpaceSafetyMargin: 0).recordsDirectory.appendingPathComponent("\(record.id).json")
-        let json = try String(contentsOf: file, encoding: .utf8)
-        XCTAssertFalse(json.contains("formatVersion") || json.contains("\"key\"") || json.contains("\"credits\""))
-
-        let handles = await makeEngine().resumePendingConversions()
-        let result = try await XCTUnwrap(handles.first).result
-        XCTAssertEqual(result.jobID, "job-9")
     }
 
     func testKeptWhileCreatingTheJobResumes() async throws {
@@ -479,20 +432,46 @@ final class ResumeEngineTests: XCTestCase {
         XCTAssertTrue(api.createdSpecifications.isEmpty)
     }
 
-    func testConcurrentResumesRunAKeptRecordOnce() async throws {
-        try await seedPreviousLaunch(phase: .processing, configuration: configuration, api: api)
-        let gate = Gate()
-        api.getJobHook = { _ in try await gate.wait() }
+    func testKeptDuringUploadResumesWithTheSameJob() async throws {
+        api.jobStatusScript = [.waiting, .processing, .finished]
+        let (phase, result) = try await keptThenResumed(failUploads: true, failDownloads: false)
+        XCTAssertEqual(phase, .uploading)
+        XCTAssertEqual(result.jobID, "job-1")
+        XCTAssertEqual(api.createdSpecifications.count, 1)
+        XCTAssertEqual(transfers.uploads.count, 1)
+    }
+
+    func testKeptDuringDownloadResumesWithoutPollingAgain() async throws {
+        api.taskCredits = 2
+        let (phase, result) = try await keptThenResumed(failUploads: false, failDownloads: true)
+        XCTAssertEqual(phase, .downloading)
+        XCTAssertEqual(result.files.count, 1)
+        XCTAssertEqual(result.credits, 2, "the credits the job reported before the pause")
+        XCTAssertEqual(api.createdSpecifications.count, 1)
+        XCTAssertEqual(transfers.uploads.count, 1)
+    }
+
+    // MARK: Discarding
+
+    func testDiscardWhereLeavesTheOthers() async throws {
+        configuration.polling.jobTimeout = 0.05
+        api.jobStatusScript = [.processing]
         let engine = makeEngine()
-        async let a = engine.resumePendingConversions()
-        async let b = engine.resumePendingConversions()
-        async let c = engine.resumePendingConversions(where: { _ in true })
-        let handles = await a + b + c
-        XCTAssertEqual(handles.count, 1)
-        let pendingWhileRunning = await engine.pendingConversions()
-        XCTAssertTrue(pendingWhileRunning.isEmpty, "a running conversion is not pending")
-        gate.open()
-        _ = try await handles.first?.result
+        _ = try? await engine.convert(try request("a.docx", key: "a"))
+        _ = try? await engine.convert(try request("b.docx", key: "b"))
+        await engine.discardPendingConversions { $0.key == "a" }
+        let left = await engine.pendingConversions().map(\.key)
+        XCTAssertEqual(left, ["b"])
+    }
+
+    /// Discarding a conversion that is running is refused.
+    func testDiscardingARunningConversionIsRefused() async throws {
+        transfers.uploadDelay = 0.3
+        let handle = engine.start(try request())
+        await waitUntil { !self.transfers.uploads.isEmpty }
+        await engine.discardPendingConversion(id: handle.id)
+        _ = try await handle.result
+        XCTAssertTrue(transfers.cancelled.isEmpty)
     }
 
     /// A multi-file conversion kept after saving its first output: discarding
@@ -501,8 +480,8 @@ final class ResumeEngineTests: XCTestCase {
         api.exportFiles = [(filename: "page-1.jpg", size: 9, url: "https://storage.example/1"),
                            (filename: "page-2.jpg", size: 9, url: "https://storage.example/2")]
         final class SecondDownloadOffline: FileTransferring, @unchecked Sendable {
-            let inner: FakeTransfers, downloads = Counter()
-            init(_ inner: FakeTransfers) { self.inner = inner }
+            let inner: FakeFileTransfers, downloads = Counter()
+            init(_ inner: FakeFileTransfers) { self.inner = inner }
             func upload(id: String, request: URLRequest, bodyFile: URL,
                         progress: @escaping @Sendable (TransferProgress) -> Void) async throws -> TransferOutcome {
                 try await inner.upload(id: id, request: request, bodyFile: bodyFile, progress: progress)

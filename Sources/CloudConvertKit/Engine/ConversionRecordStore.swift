@@ -31,7 +31,8 @@ public struct ConversionRecord: Codable, Equatable, Sendable {
     /// Credits the job consumed, once it finished: kept for a resume that
     /// only has the downloads left.
     public var credits: Int?
-    /// The record's format: nil for records written by CloudConvertKit 1.x.
+    /// The record's format, `currentFormatVersion` when written; nil for the
+    /// first format, which carried no version.
     public var formatVersion: Int?
 
     static let currentFormatVersion = 2

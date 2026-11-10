@@ -1,0 +1,46 @@
+# Publishes the GitHub release for a version tag (1.2.3) pushed from main.
+# The tag is the release for SwiftPM; this adds the GitHub release, named
+# "CloudConvertKit 1.2.3", with that version's section of CHANGELOG.md as its
+# notes. Nothing is published unless the tagged commit is on main, the
+# changelog has the version's section, and the tests pass on it.
+name: Release
+
+on:
+  push:
+    tags: ['[0-9]+.[0-9]+.[0-9]+']
+
+jobs:
+  check:
+    name: Check the tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: On main
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main ||
+            { echo "::error::$GITHUB_REF_NAME is not on main."; exit 1; }
+      - name: In the changelog
+        run: .github/scripts/changelog-section.sh "$GITHUB_REF_NAME" > /dev/null
+
+  tests:
+    needs: check
+    uses: ./.github/workflows/tests.yml
+
+  release:
+    name: Publish
+    needs: tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/changelog-section.sh "$GITHUB_REF_NAME" \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME" > notes.md
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "CloudConvertKit $GITHUB_REF_NAME" --notes-file notes.md

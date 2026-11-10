@@ -1,0 +1,88 @@
+# The whole test suite (Tests/), against the in-memory fakes, with no
+# network: on macOS, under Thread Sanitizer, and on the newest iPhone
+# simulator. It also builds the package for an iOS device and Mac Catalyst,
+# which can't run the tests here.
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call: # release.yml tests a tag before it publishes the release
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Versions
+        run: |
+          xcodebuild -version
+          swift --version
+      - name: Test
+        # StressTests prints its seed; replay a failure with CCK_STRESS_SEED.
+        run: swift test
+
+  thread-sanitizer:
+    name: Thread Sanitizer
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Versions
+        run: swift --version
+      - name: Test
+        run: swift test --sanitize=thread
+
+  ios:
+    name: iOS
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Versions
+        run: xcodebuild -version
+      - name: Pick a simulator
+        # The newest available iPhone, whatever the runner image has.
+        run: |
+          udid=$(xcrun simctl list devices available --json | python3 -c '
+          import json, sys
+          runtimes = json.load(sys.stdin)["devices"]
+          phones = [(runtime, d) for runtime, devices in runtimes.items() if "iOS" in runtime
+                    for d in devices if d["name"].startswith("iPhone")]
+          version = lambda r: [int(p) for p in r.rsplit("iOS-", 1)[1].split("-")]
+          runtime, device = max(phones, key=lambda p: version(p[0]))
+          print(device["udid"])
+          print(device["name"], runtime, file=sys.stderr)
+          ')
+          echo "SIMULATOR=$udid" >> "$GITHUB_ENV"
+      - name: Boot the simulator
+        # Booting while the tests run slows the first ones past their timeouts.
+        run: xcrun simctl bootstatus "$SIMULATOR" -b
+      - name: Test on the simulator
+        run: |
+          xcodebuild test \
+            -scheme CloudConvertKit-Package \
+            -destination "id=$SIMULATOR" \
+            -derivedDataPath .build/xcode
+      - name: Build for a device
+        run: |
+          xcodebuild build-for-testing \
+            -scheme CloudConvertKit-Package \
+            -destination generic/platform=iOS \
+            -derivedDataPath .build/xcode \
+            CODE_SIGNING_ALLOWED=NO
+      - name: Build for Mac Catalyst
+        run: |
+          xcodebuild build-for-testing \
+            -scheme CloudConvertKit-Package \
+            -destination 'generic/platform=macOS,variant=Mac Catalyst' \
+            -derivedDataPath .build/xcode \
+            CODE_SIGNING_ALLOWED=NO

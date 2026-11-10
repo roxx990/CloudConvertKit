@@ -1,8 +1,9 @@
 //  Lets the host app keep the process alive for a short while after it is
 //  backgrounded without the kit importing UIKit. `SystemBackgroundActivity`
-//  (the default) does it with Foundation alone. Uploads and downloads already run on a background URLSession; this
-//  only matters for the seconds between them (creating the job, polling,
-//  moving the output into place).
+//  (the default) does it with Foundation alone. Uploads and downloads
+//  already run on a background URLSession; this only matters for the
+//  seconds between them (creating the job, polling, moving the output into
+//  place).
 //
 
 import Foundation

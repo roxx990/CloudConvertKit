@@ -23,12 +23,12 @@ final class CatalogTests: XCTestCase {
         return try! JSONDecoder().decode(CCOperationOption.self, from: data)
     }
 
-    private func catalog(_ api: FakeAPI, cache: URL? = nil, minimum: Int = 0) -> CloudConvertCatalog {
+    private func catalog(_ api: FakeCloudConvertAPI, cache: URL? = nil, minimum: Int = 0) -> CloudConvertCatalog {
         CloudConvertCatalog(api: api, cacheURL: cache, minimumInputFormats: minimum)
     }
 
     func testPairsAndKnownFailures() async throws {
-        let api = FakeAPI()
+        let api = FakeCloudConvertAPI()
         api.conversions = Self.rows
         let catalog = catalog(api)
         let docxToPDF = try await catalog.supports(ConversionPair("docx", "pdf"))
@@ -42,7 +42,7 @@ final class CatalogTests: XCTestCase {
     }
 
     func testIssuesInARequest() async throws {
-        let api = FakeAPI()
+        let api = FakeCloudConvertAPI()
         api.conversions = Self.rows
         api.operationRows = ["merge": [CCOperation(operation: "merge", inputFormat: nil, outputFormat: "pdf", engine: "qpdf",
                                                    options: [Self.option("pdf_a")])]]
@@ -74,11 +74,11 @@ final class CatalogTests: XCTestCase {
 
     func testTheListIsCachedOnDiskAndUsedWhenTheAPIFails() async throws {
         let cache = TestFiles.temporaryDirectory().appendingPathComponent("catalog.json")
-        let api = FakeAPI()
+        let api = FakeCloudConvertAPI()
         api.conversions = Self.rows
         _ = try await catalog(api, cache: cache).allConversions()
 
-        let offline = FakeAPI()
+        let offline = FakeCloudConvertAPI()
         offline.convertFormatsError = .notConnected
         let rows = try await catalog(offline, cache: cache).allConversions()
         XCTAssertEqual(rows.count, Self.rows.count)
@@ -88,11 +88,11 @@ final class CatalogTests: XCTestCase {
 
     func testAnExpiredCopyIsUsedWhenTheAPIFails() async throws {
         let cache = TestFiles.temporaryDirectory().appendingPathComponent("catalog.json")
-        let api = FakeAPI()
+        let api = FakeCloudConvertAPI()
         api.conversions = Self.rows
         _ = try await catalog(api, cache: cache).allConversions()
 
-        let offline = FakeAPI()
+        let offline = FakeCloudConvertAPI()
         offline.convertFormatsError = .notConnected
         let stale = CloudConvertCatalog(api: offline, cacheURL: cache, maxAge: 0, minimumInputFormats: 0)
         let rows = try await stale.allConversions()
@@ -101,7 +101,7 @@ final class CatalogTests: XCTestCase {
     }
 
     func testEnginesAndOperationOptions() async throws {
-        let api = FakeAPI()
+        let api = FakeCloudConvertAPI()
         api.conversions = Self.rows
         api.operationRows = ["optimize": [CCOperation(operation: "optimize", inputFormat: "pdf", outputFormat: nil, engine: "3heights",
                                                       options: [Self.option("profile", values: [.string("web"), .string("max")])])]]
@@ -119,7 +119,7 @@ final class CatalogTests: XCTestCase {
 
     func testAListThatLooksCutShortIsNotCached() async throws {
         let cache = TestFiles.temporaryDirectory().appendingPathComponent("catalog.json")
-        let api = FakeAPI()
+        let api = FakeCloudConvertAPI()
         api.conversions = Self.rows
         _ = try await catalog(api, cache: cache, minimum: 50).allConversions()
         XCTAssertFalse(FileManager.default.fileExists(atPath: cache.path))

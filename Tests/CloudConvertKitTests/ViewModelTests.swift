@@ -18,8 +18,8 @@ final class ConversionViewModelTests: XCTestCase {
     }
 
     private struct Setup {
-        let api: FakeAPI
-        let transfers: FakeTransfers
+        let api: FakeCloudConvertAPI
+        let transfers: FakeFileTransfers
         let network: DroppedNetwork
         let engine: ConversionEngine
         let model: ConversionViewModel
@@ -30,7 +30,7 @@ final class ConversionViewModelTests: XCTestCase {
     /// A model whose only item stopped with a resumable error: the first
     /// status check found the device offline, and the network stayed away.
     private func keptItem(store: ((CloudConvertConfiguration) -> any ConversionRecordStoring)? = nil) async throws -> Setup {
-        let api = FakeAPI(), transfers = FakeTransfers(), network = DroppedNetwork()
+        let api = FakeCloudConvertAPI(), transfers = FakeFileTransfers(), network = DroppedNetwork()
         api.serverHasUpload = { transfers.receivedUploadsSnapshot > 0 }
         api.getJobErrors = [.notConnected]
         let work = TestFiles.temporaryDirectory(), out = TestFiles.temporaryDirectory()
@@ -78,7 +78,7 @@ final class ConversionViewModelTests: XCTestCase {
     /// With `resumesWhenOnline`, an item paused offline finishes by itself
     /// when the network returns, without the user retrying it.
     func testAnItemPausedOfflineFinishesWhenTheNetworkReturns() async throws {
-        let api = FakeAPI(), transfers = FakeTransfers(), network = FakeConnectivity()
+        let api = FakeCloudConvertAPI(), transfers = FakeFileTransfers(), network = FakeConnectivity()
         api.serverHasUpload = { transfers.receivedUploadsSnapshot > 0 }
         api.getJobHook = { [api] _ in
             if network.isConnected, api.pollCount == 0 {
@@ -204,7 +204,7 @@ final class ConversionViewModelTests: XCTestCase {
     /// The user taps Retry the moment the row shows `.failed`, while the
     /// engine is still writing the line that says it kept the conversion.
     func testRetryAsSoonAsTheItemShowsFailedResumesIt() async throws {
-        let api = FakeAPI(), transfers = FakeTransfers(), network = DroppedNetwork()
+        let api = FakeCloudConvertAPI(), transfers = FakeFileTransfers(), network = DroppedNetwork()
         api.serverHasUpload = { transfers.receivedUploadsSnapshot > 0 }
         api.getJobErrors = [.notConnected]
         let work = TestFiles.temporaryDirectory(), out = TestFiles.temporaryDirectory()

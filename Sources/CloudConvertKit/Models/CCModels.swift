@@ -496,8 +496,8 @@ extension URL {
     /// Parses `string` the way iOS 17 and macOS 14 do, on every supported
     /// system. Those percent-encode the characters that are invalid in a URL
     /// (a space, non-ASCII, `|`, `[]` outside the host, a `%` that starts no
-    /// escape, a `#` inside the fragment); older systems return `nil`
-    /// instead, which dropped the file.
+    /// escape, a `#` inside the fragment), where older systems return `nil`
+    /// and an export URL would be lost.
     init?(lenient string: String) {
         guard let url = URL(string: string) ?? URL(string: URL.encodingInvalidCharacters(string)) else { return nil }
         self = url

@@ -17,7 +17,7 @@ public enum CloudConvertEnvironment: Equatable, Sendable {
     /// Direct sandbox: unlimited jobs, only whitelisted files.
     case sandbox
     /// Your own backend that forwards the CloudConvert v2 REST surface and holds
-    /// the API key. See README → "Proxy contract".
+    /// the API key. See "Proxy contract" in Docs/Configuration.md.
     case proxy(baseURL: URL)
 
     public var baseURL: URL {
