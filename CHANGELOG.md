@@ -2,8 +2,9 @@
 
 ## 2.0.1
 
-Nothing changes in the package itself; it is now tested on every change and released from tags, its tests are organised by subject, and its documentation is split into pages.
+The kit compiles with Swift 6.3 (Xcode 26), and nothing else changes in what it does. It is now tested on every change and released from tags, its tests are organised by subject, and its documentation is split into pages.
 
+- **Builds with Swift 6.3.** Swift 6.3's compiler never finished compiling `ConversionEngine.swift`: its closure-lifetime pass grew without bound on the upload function, which held the re-attach, the body writing and the retry loop in one. Uploads and downloads are now split into smaller functions that do the same thing. CI builds and tests the kit with Xcode 26 on every change.
 - **CI.** GitHub Actions runs the whole suite on every push to `main` and every pull request: on macOS, under Thread Sanitizer and on the newest iPhone simulator, and builds it for an iOS device and Mac Catalyst. See [Testing](Docs/Testing.md#ci).
 - **Releases from tags.** Pushing a version tag on `main` runs the tests on it and publishes the GitHub release, with the version's changelog section as its notes. See [Releasing](CONTRIBUTING.md#releasing).
 - **Tests by subject.** The engine's tests are split into `PipelineTests`, `FailureHandlingTests`, `CancellationTests`, `ResumeTests`, `EngineControlTests` and `RealAPIClientTests`, on a shared `EngineTestCase` in place of seven copies of the same setup; storage tests have a file of their own, and the shared helpers are in `Support/`. Two tests that repeated others are gone (an undecodable poll, credits on the result: both checked with the real API client), three that differed only in the failure code are one, and a hand-built resume record gives way to `seedPreviousLaunch`: 171 tests, from 175, with the same coverage. See [Testing](Docs/Testing.md).

@@ -808,35 +808,9 @@ public final class ConversionEngine: @unchecked Sendable {
                            formMayBeStale: Bool,
                            record: inout ConversionRecord,
                            reporter: ProgressReporter) async throws {
-        // Resume case 2: re-attach to the upload a previous launch started.
-        // One that is gone, or failed while the app was not running, is sent
-        // again. Any other result is the first attempt of the retry loop
-        // below, judged exactly like a fresh upload's: a 5xx is retried
-        // against the same form, a network error waits for the network.
-        // Either way it may have delivered the file and lost only the
-        // response, so the server is asked before the file is sent again.
-        var reattachFailure: Error?
         let reattached = record.uploadTransfers[taskName] != nil
-        if let existingID = record.uploadTransfers[taskName] {
-            do {
-                let outcome = try await reportingOffline(reporter, restoreTo: .uploading, jobID: record.jobID) {
-                    try await transfers.awaitExistingTransfer(id: existingID) { [reporter] in
-                        reporter.upload(taskName: taskName, progress: $0)
-                    }
-                }
-                if outcome.status != nil {
-                    try validateUpload(outcome)
-                    transfers.forget(id: existingID)
-                    return
-                }
-            } catch CloudConvertError.transferLost {
-            } catch {
-                reattachFailure = error
-            }
-            transfers.forget(id: existingID)
-            if reattachFailure == nil { logger.notice("Conversion \(record.id): upload \(taskName) was lost; restarting it") }
-            try Task.checkCancellation()
-        }
+        let previous = try await reattachUpload(taskName: taskName, record: record, reporter: reporter)
+        if previous.finished { return }
 
         // Fresh upload: the form must exist and accept the size. A form a
         // previous launch received may also have expired, but the device
@@ -857,10 +831,52 @@ public final class ConversionEngine: @unchecked Sendable {
         try storage.ensureDirectory(bodyDirectory)
         let bodyURL = bodyDirectory.appendingPathComponent("\(taskName).multipart")
         defer { try? FileManager.default.removeItem(at: bodyURL) }
+        let body = try await writeUploadBody(form: form, staged: staged, to: bodyURL)
+        try await sendUpload(taskName: taskName, form: form, body: body, reattached: reattached,
+                             firstFailure: previous.failure, record: &record, reporter: reporter)
+    }
 
-        // Writing the body copies the whole file: blocking IO, off the pool.
+    // `uploadOne` is split in parts because Swift 6.3 can't compile one
+    // function holding them all in reasonable time: its closure-lifetime
+    // pass grows with every closure times every exit path.
+
+    /// Re-attaches to the upload a previous launch started, if any.
+    /// `finished` when it arrived. One that is gone, or failed while the app
+    /// was not running, is sent again. Any other failure is the first attempt
+    /// of `sendUpload`'s retry loop, judged exactly like a fresh upload's: a
+    /// 5xx is retried against the same form, a network error waits for the
+    /// network. Either way it may have delivered the file and lost only the
+    /// response, so the server is asked before the file is sent again.
+    private func reattachUpload(taskName: String, record: ConversionRecord,
+                                reporter: ProgressReporter) async throws -> (finished: Bool, failure: Error?) {
+        guard let existingID = record.uploadTransfers[taskName] else { return (false, nil) }
+        var failure: Error?
+        do {
+            let outcome = try await reportingOffline(reporter, restoreTo: .uploading, jobID: record.jobID) {
+                try await transfers.awaitExistingTransfer(id: existingID) { [reporter] in
+                    reporter.upload(taskName: taskName, progress: $0)
+                }
+            }
+            if outcome.status != nil {
+                try validateUpload(outcome)
+                transfers.forget(id: existingID)
+                return (true, nil)
+            }
+        } catch CloudConvertError.transferLost {
+        } catch {
+            failure = error
+        }
+        transfers.forget(id: existingID)
+        if failure == nil { logger.notice("Conversion \(record.id): upload \(taskName) was lost; restarting it") }
+        try Task.checkCancellation()
+        return (false, failure)
+    }
+
+    /// Writes the multipart body: it copies the whole file, so it is blocking
+    /// IO, off the cooperative pool.
+    private func writeUploadBody(form: CCUploadForm, staged: StagedInput, to bodyURL: URL) async throws -> MultipartFormBody {
         let mimeType = MultipartFormWriter.mimeType(forExtension: (staged.filename as NSString).pathExtension)
-        let body = try await BlockingWork.runCancellable { isCancelled in
+        return try await BlockingWork.runCancellable { isCancelled in
             try MultipartFormWriter.writeUploadBody(form: form,
                                                     file: staged.stagedURL,
                                                     filename: staged.filename,
@@ -868,14 +884,22 @@ public final class ConversionEngine: @unchecked Sendable {
                                                     to: bodyURL,
                                                     isCancelled: isCancelled)
         }
+    }
 
+    /// Sends the body, retrying against the same form. Each HTTP attempt gets
+    /// its own transfer id; the record always points at the most recent one
+    /// so a relaunch can re-attach to it.
+    private func sendUpload(taskName: String,
+                            form: CCUploadForm,
+                            body: MultipartFormBody,
+                            reattached: Bool,
+                            firstFailure: Error?,
+                            record: inout ConversionRecord,
+                            reporter: ProgressReporter) async throws {
         // URLSession derives Content-Length from the file itself.
-        let request: URLRequest = {
-            var request = URLRequest(url: form.url)
-            request.httpMethod = "POST"
-            request.setValue(body.contentType, forHTTPHeaderField: "Content-Type")
-            return request
-        }()
+        var request = URLRequest(url: form.url)
+        request.httpMethod = "POST"
+        request.setValue(body.contentType, forHTTPHeaderField: "Content-Type")
 
         let conversionID = record.id
         let jobID = record.jobID
@@ -883,13 +907,10 @@ public final class ConversionEngine: @unchecked Sendable {
         let uploadAttempt = Counter()
         let transfers = self.transfers
         let waitForNetwork = makeNetworkWaiter(reporter: reporter, restoreTo: .uploading)
-        let firstFailure = reattachFailure
-
-        // Each HTTP attempt gets its own transfer id; the record always points
-        // at the most recent one so a relaunch can re-attach to it.
         let recordBox = RecordBox(record)
         let store = self.store
         let logger = self.logger
+        let sentRequest = request
         defer { record = recordBox.value }
         try await retrying(policy: configuration.uploadRetryPolicy, phase: .uploading, logger: logger,
                            label: "upload \(taskName)", waitForNetwork: waitForNetwork,
@@ -915,7 +936,7 @@ public final class ConversionEngine: @unchecked Sendable {
             await store.save(recordBox.value)
 
             let outcome = try await self.reportingOffline(reporter, restoreTo: .uploading, jobID: jobID) {
-                try await transfers.upload(id: transferID, request: request, bodyFile: body.fileURL) { [reporter] in
+                try await transfers.upload(id: transferID, request: sentRequest, bodyFile: body.fileURL) { [reporter] in
                     reporter.upload(taskName: taskName, progress: $0)
                 }
             }
@@ -1053,33 +1074,49 @@ public final class ConversionEngine: @unchecked Sendable {
                              to destination: URL,
                              record: inout ConversionRecord,
                              reporter: ProgressReporter) async throws -> URL {
-        // Re-attach to the download a previous launch started; as for uploads,
-        // anything but a lost transfer is the first attempt of the loop below.
-        var reattachFailure: Error?
-        if let existingID = record.downloadTransfers[index] {
-            do {
-                let outcome = try await reportingOffline(reporter, restoreTo: .downloading, jobID: record.jobID) {
-                    try await transfers.awaitExistingTransfer(id: existingID) { [reporter] in
-                        reporter.download(index: index, progress: $0)
-                    }
-                }
-                // Failed without a response while the app was not running: download again.
-                if outcome.status != nil, let url = try validateDownload(outcome, exported: exported) {
-                    transfers.forget(id: existingID)
-                    return url
-                }
-            } catch CloudConvertError.transferLost {
-            } catch {
-                reattachFailure = error
-            }
-            transfers.forget(id: existingID)
-        }
+        let previous = try await reattachDownload(index: index, exported: exported, record: record, reporter: reporter)
+        if let url = previous.url { return url }
+        return try await sendDownload(index: index, exported: exported, to: destination,
+                                      firstFailure: previous.failure, record: &record, reporter: reporter)
+    }
 
-        let request: URLRequest = {
-            var request = URLRequest(url: exported.url)
-            request.httpMethod = "GET"
-            return request
-        }()
+    /// Re-attaches to the download a previous launch started, if any: its
+    /// file when it arrived. As for uploads, anything but a lost transfer is
+    /// the first attempt of `sendDownload`'s retry loop. Kept apart from it
+    /// for Swift 6.3's sake, as `uploadOne` is.
+    private func reattachDownload(index: Int, exported: ExportedFileRecord, record: ConversionRecord,
+                                  reporter: ProgressReporter) async throws -> (url: URL?, failure: Error?) {
+        guard let existingID = record.downloadTransfers[index] else { return (nil, nil) }
+        var failure: Error?
+        do {
+            let outcome = try await reportingOffline(reporter, restoreTo: .downloading, jobID: record.jobID) {
+                try await transfers.awaitExistingTransfer(id: existingID) { [reporter] in
+                    reporter.download(index: index, progress: $0)
+                }
+            }
+            // Failed without a response while the app was not running: download again.
+            if outcome.status != nil, let url = try validateDownload(outcome, exported: exported) {
+                transfers.forget(id: existingID)
+                return (url, nil)
+            }
+        } catch CloudConvertError.transferLost {
+        } catch {
+            failure = error
+        }
+        transfers.forget(id: existingID)
+        return (nil, failure)
+    }
+
+    /// Downloads the file, retrying; like uploads, each attempt gets its own
+    /// transfer id, recorded for a relaunch to re-attach to.
+    private func sendDownload(index: Int,
+                              exported: ExportedFileRecord,
+                              to destination: URL,
+                              firstFailure: Error?,
+                              record: inout ConversionRecord,
+                              reporter: ProgressReporter) async throws -> URL {
+        var request = URLRequest(url: exported.url)
+        request.httpMethod = "GET"
 
         let conversionID = record.id
         let jobID = record.jobID
@@ -1087,8 +1124,8 @@ public final class ConversionEngine: @unchecked Sendable {
         let downloadAttempt = Counter()
         let transfers = self.transfers
         let store = self.store
-        let firstFailure = reattachFailure
         let recordBox = RecordBox(record)
+        let sentRequest = request
         defer { record = recordBox.value }
         let waitForNetwork = makeNetworkWaiter(reporter: reporter, restoreTo: .downloading)
 
@@ -1106,7 +1143,7 @@ public final class ConversionEngine: @unchecked Sendable {
             await store.save(recordBox.value)
 
             let outcome = try await self.reportingOffline(reporter, restoreTo: .downloading, jobID: jobID) {
-                try await transfers.download(id: transferID, request: request, destination: destination) { [reporter] in
+                try await transfers.download(id: transferID, request: sentRequest, destination: destination) { [reporter] in
                     reporter.download(index: index, progress: $0)
                 }
             }
